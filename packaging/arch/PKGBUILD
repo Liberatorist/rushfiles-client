@@ -1,6 +1,6 @@
 # Maintainer: Liberatorist
 pkgname=rfmount-bin
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Unofficial Linux client for RushFiles: mount your shares as a network drive"
 arch=('x86_64' 'aarch64')
@@ -12,8 +12,8 @@ options=('!strip')
 _base="rushfiles-v${pkgver}-linux"
 source_x86_64=("$url/releases/download/v$pkgver/$_base-amd64.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/$_base-arm64.tar.gz")
-sha256sums_x86_64=('1abd446aef2e468f795d0bf9b2a1c9275725574f8557298dde9e980e8f3aa60d')
-sha256sums_aarch64=('a00c5bf4c6143a165596b57ccf98019a4dd50462b700c0bb9084674a45cf20ff')
+sha256sums_x86_64=('b8ff3d78276457d19dcdc377ed98788e9a0310a0fd39fb06f5efe5fea2734664')
+sha256sums_aarch64=('15db20c65a881265704eb313975c7b3305aa70588223540551552c2ebef4d4d7')
 
 package() {
   local _arch=amd64

@@ -85,7 +85,10 @@ the Actions tab. To publish them on the release page, push a version tag:
 
     git tag v0.1.0 && git push origin v0.1.0
 
-Each tarball holds the binary and this README, so you can unpack it and run `./rushfiles`
+Once the release is published, `./bump-pkg.sh 0.2.1` points the Arch package at it, which
+needs `pacman-contrib`.
+
+Each tarball holds the binary, this README and the license, so you can unpack it and run `./rushfiles`
 without building anything. Check a download with
 `sha256sum -c --ignore-missing sha256sums.txt`.
 
