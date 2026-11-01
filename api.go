@@ -141,7 +141,12 @@ func (v *VirtualFile) version() string {
 	return fmt.Sprintf("%d-%d", v.size(), v.mtime().UnixMilli())
 }
 
+// lockedByOther follows the Windows client: a lock only binds other users, and
+// its holder may keep working on any device.
 func (v *VirtualFile) lockedByOther(userID string) bool {
+	if len(v.FileLock) == 0 {
+		return false
+	}
 	var lock struct {
 		IsLocked bool
 		LockedBy string

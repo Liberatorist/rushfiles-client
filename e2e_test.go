@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -792,5 +793,75 @@ func TestIdlePollDoesNotWrite(t *testing.T) {
 	tr.finish(share, nil, 5, false)
 	if read() != changes || tr.reconciledAt != before {
 		t.Fatal("an idle poll wrote to the database")
+	}
+}
+
+func TestLocksBindOtherUsersOnly(t *testing.T) {
+	m := newMock(t)
+	lock := func(id, holder string) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		m.files[id].vf["FileLock"] = map[string]any{"IsLocked": true, "LockedBy": holder}
+		m.bump(id)
+	}
+	m.add("mine", testShare, "mine.txt", 128, []byte("mine\n"))
+	m.add("spare", testShare, "spare.txt", 128, []byte("spare\n"))
+	lock("f1", "someone-else")
+	lock("mine", "user1")
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "50ms")
+	readme := filepath.Join(dir, "readme.txt")
+	waitFor(t, "tree with the lock", func() bool {
+		st, err := os.Stat(readme)
+		return err == nil && st.Mode().Perm() == 0o444
+	})
+	m.events()
+
+	spare := filepath.Join(dir, "spare.txt")
+	tmp := filepath.Join(dir, "saved.tmp")
+	if err := os.WriteFile(tmp, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.events()
+	for name, try := range map[string]func() error{
+		"write":             func() error { return os.WriteFile(readme, []byte("x"), 0o644) },
+		"truncate":          func() error { return os.Truncate(readme, 0) },
+		"delete":            func() error { return os.Remove(readme) },
+		"rename":            func() error { return os.Rename(readme, filepath.Join(dir, "gone.txt")) },
+		"move":              func() error { return os.Rename(readme, filepath.Join(dir, "Docs", "gone.txt")) },
+		"replace by rename": func() error { return os.Rename(tmp, readme) },
+	} {
+		if err := try(); !errors.Is(err, os.ErrPermission) {
+			t.Errorf("%s of a file locked by someone else: %v", name, err)
+		}
+	}
+	if ev := m.events(); ev != "" {
+		t.Errorf("locked file reached the server: %s", ev)
+	}
+	if got := string(m.content("readme.txt")); got != "hello from the server\n" {
+		t.Fatalf("locked content changed: %q", got)
+	}
+	// Reading stays allowed, and so does everything for the lock's holder.
+	if got, err := os.ReadFile(readme); err != nil || len(got) == 0 {
+		t.Fatalf("read of a locked file: %q %v", got, err)
+	}
+	mine := filepath.Join(dir, "mine.txt")
+	if st, err := os.Stat(mine); err != nil || st.Mode().Perm() != 0o644 {
+		t.Fatalf("own lock changed the mode: %v %v", st, err)
+	}
+	if err := os.WriteFile(mine, []byte("edited\n"), 0o644); err != nil {
+		t.Fatalf("edit under own lock: %v", err)
+	}
+	if err := os.Rename(mine, filepath.Join(dir, "mine2.txt")); err != nil {
+		t.Fatalf("rename under own lock: %v", err)
+	}
+
+	// A lock taken after the last sync is caught by the fresh server record.
+	m.mu.Lock()
+	m.files["spare"].vf["FileLock"] = map[string]any{"IsLocked": true, "LockedBy": "someone-else"}
+	m.mu.Unlock() // no tick: the tree doesn't know yet
+	if err := os.Remove(spare); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("delete of a freshly locked file: %v", err)
 	}
 }

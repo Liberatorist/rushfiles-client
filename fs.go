@@ -217,6 +217,9 @@ func (n *node) fillAttr(a *fuse.Attr) {
 		return
 	}
 	a.Mode = syscall.S_IFREG | 0o644
+	if n.vf.lockedByOther(n.c.userID) {
+		a.Mode = syscall.S_IFREG | 0o444
+	}
 	a.Nlink = 1
 	a.Size = uint64(n.vf.size())
 	mtime := n.vf.mtime()
@@ -469,10 +472,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		if n.c.readOnly {
 			return nil, 0, syscall.EROFS
 		}
-		n.mu.Lock()
-		locked := n.vf.lockedByOther(n.c.userID)
-		n.mu.Unlock()
-		if locked {
+		if n.locked() {
 			return nil, 0, syscall.EACCES
 		}
 	}
@@ -486,6 +486,15 @@ func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	n.handles++
 	n.mu.Unlock()
 	return &editHandle{n: n}, 0, 0
+}
+
+// locked reports whether another user holds a lock, as of the last sync. Rename,
+// move and delete check the fresh server record instead, and the server has the
+// final word on uploads.
+func (n *node) locked() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.vf.lockedByOther(n.c.userID)
 }
 
 func (n *node) touch() {
@@ -672,6 +681,9 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if n.c.readOnly {
 			return syscall.EROFS
 		}
+		if n.locked() {
+			return syscall.EACCES
+		}
 		if err := n.openWork(ctx, size == 0); err != nil {
 			return toErrno(err)
 		}
@@ -805,6 +817,9 @@ func (n *node) drop(ctx context.Context, name string) syscall.Errno {
 	if vf, errno = n.fullRecord(ctx, vf); errno != 0 {
 		return errno
 	}
+	if vf.lockedByOther(n.c.userID) {
+		return syscall.EACCES
+	}
 	if err := n.c.remove(ctx, n.share, vf); err != nil {
 		return toErrno(err)
 	}
@@ -863,6 +878,9 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	}
 	if vf, errno = n.fullRecord(ctx, vf); errno != 0 {
 		return errno
+	}
+	if vf.lockedByOther(n.c.userID) {
+		return syscall.EACCES
 	}
 	if existing, errno := dst.find(ctx, newName); errno == 0 {
 		if existing.isDir() {
