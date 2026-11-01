@@ -38,3 +38,16 @@ func TestExpandHome(t *testing.T) {
 		t.Fatalf("shortenHome matched a sibling folder: %q", got)
 	}
 }
+
+func TestOnlyPackagedBinariesRunInPlace(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/usr/bin/rushfiles":              true,
+		"/home/a/.local/bin/rushfiles":    false,
+		"/home/a/dev/rushfiles/rushfiles": false,
+		"/tmp/usr/bin/rushfiles":          false,
+	} {
+		if got := managedBySystem(path); got != want {
+			t.Errorf("%s: got %v", path, got)
+		}
+	}
+}

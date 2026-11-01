@@ -43,7 +43,7 @@ jobs:
           name="rushfiles-${GITHUB_REF_NAME//\//-}-linux-$GOARCH"
           mkdir -p "dist/$name"
           go build -trimpath -ldflags='-s -w' -o "dist/$name/rushfiles" .
-          cp README.md "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v7
         with:

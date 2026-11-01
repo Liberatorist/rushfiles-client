@@ -21,6 +21,16 @@ The same steps work without the setup screen:
 
 Stop with Ctrl-C or `fusermount3 -u ~/RushFiles`. Each share appears as a top-level folder.
 
+### Arch Linux
+
+The package definition is in `packaging/arch`. To build and install the latest release:
+
+    cd packaging/arch && makepkg -si
+
+Run `rushfiles autostart` again after installing, so the service uses the package instead of
+any copy in `~/.local/bin`. After an upgrade, `systemctl --user restart rushfiles` picks up
+the new version.
+
 ## Mount on startup
 
 The setup screen does this for you. To do it from a script, sign in with `./rushfiles login`
@@ -78,3 +88,10 @@ the Actions tab. To publish them on the release page, push a version tag:
 Each tarball holds the binary and this README, so you can unpack it and run `./rushfiles`
 without building anything. Check a download with
 `sha256sum -c --ignore-missing sha256sums.txt`.
+
+## License
+
+Copyright (C) 2026 Liberatorist. Licensed under the GNU Affero General Public License v3.0
+only; see `LICENSE`. This is an unofficial project, not affiliated with RushFiles A/S. The
+license covers this project's code, and gives no rights to RushFiles' software, service or
+trademarks.

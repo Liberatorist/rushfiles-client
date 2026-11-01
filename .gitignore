@@ -1,2 +1,5 @@
 /rushfiles
 /dist/
+/packaging/arch/*
+!/packaging/arch/PKGBUILD
+!/packaging/arch/.SRCINFO

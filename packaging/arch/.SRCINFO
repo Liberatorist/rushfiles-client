@@ -1,0 +1,17 @@
+pkgbase = rfmount-bin
+	pkgdesc = Unofficial Linux client for RushFiles: mount your shares as a network drive
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/Liberatorist/rushfiles-client
+	arch = x86_64
+	arch = aarch64
+	license = AGPL-3.0-only
+	depends = fuse3
+	optdepends = xdg-utils: open the browser for login
+	options = !strip
+	source_x86_64 = https://github.com/Liberatorist/rushfiles-client/releases/download/v0.2.0/rushfiles-v0.2.0-linux-amd64.tar.gz
+	sha256sums_x86_64 = 1abd446aef2e468f795d0bf9b2a1c9275725574f8557298dde9e980e8f3aa60d
+	source_aarch64 = https://github.com/Liberatorist/rushfiles-client/releases/download/v0.2.0/rushfiles-v0.2.0-linux-arm64.tar.gz
+	sha256sums_aarch64 = a00c5bf4c6143a165596b57ccf98019a4dd50462b700c0bb9084674a45cf20ff
+
+pkgname = rfmount-bin

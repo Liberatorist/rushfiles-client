@@ -27,9 +27,22 @@ func defaultMountDir() string {
 	return filepath.Join(home, "RushFiles")
 }
 
-func autostartBinary() string {
+func localBinary() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "bin", "rushfiles")
+}
+
+func managedBySystem(path string) bool { return strings.HasPrefix(path, "/usr/") }
+
+// autostartBinary is what the service runs. A packaged binary is used in place, so
+// upgrades reach the service; anything else is copied, as it may be a build tree.
+func autostartBinary() string {
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil && managedBySystem(resolved) {
+			return resolved
+		}
+	}
+	return localBinary()
 }
 
 func autostartUnitPath() string {
@@ -152,13 +165,23 @@ func installAutostart(cfg autostartConfig) error {
 		return fmt.Errorf("fusermount3 not found, install fuse3")
 	}
 	bin, unit := autostartBinary(), autostartUnitPath()
-	for _, dir := range []string{cfg.Dir, filepath.Dir(unit), filepath.Dir(bin)} {
+	for _, dir := range []string{cfg.Dir, filepath.Dir(unit)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
-	if err := copyBinary(bin); err != nil {
-		return err
+	if managedBySystem(bin) {
+		// An older copy would shadow the package on PATH.
+		if err := os.Remove(localBinary()); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+			return err
+		}
+		if err := copyBinary(bin); err != nil {
+			return err
+		}
 	}
 	if err := os.WriteFile(unit, []byte(renderAutostartUnit(bin, fusermount, cfg)), 0o644); err != nil {
 		return err
@@ -174,7 +197,7 @@ func installAutostart(cfg autostartConfig) error {
 
 func uninstallAutostart() error {
 	_ = systemctl("disable", "--now", autostartService)
-	for _, path := range []string{autostartUnitPath(), autostartBinary()} {
+	for _, path := range []string{autostartUnitPath(), localBinary()} {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}

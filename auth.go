@@ -23,10 +23,9 @@ import (
 
 // Values taken from the Windows client (AuthenticationService, Skinning/config.json).
 const (
-	oidcClientID     = "rushfiles.PCClient"
-	oidcClientSecret = "secret"
-	oidcScope        = "openid profile domain_api offline_access"
-	oidcRedirectURI  = "rushfiles://signedin"
+	oidcClientID    = "rushfiles.PCClient"
+	oidcScope       = "openid profile domain_api offline_access"
+	oidcRedirectURI = "rushfiles://signedin"
 )
 
 func authority() string { return envOr("RUSHFILES_AUTHORITY", "https://auth.rushfiles.com") }
@@ -124,7 +123,6 @@ type tokenResponse struct {
 
 func requestToken(ctx context.Context, form url.Values) (*tokenResponse, error) {
 	form.Set("client_id", oidcClientID)
-	form.Set("client_secret", oidcClientSecret)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, authority()+"/connect/token", strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err

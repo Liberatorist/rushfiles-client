@@ -506,13 +506,14 @@ components:
       type: openIdConnect
       description: |
         Authorization code flow with PKCE (S256) against `https://auth.rushfiles.com`. The
-        desktop client uses client id `rushfiles.PCClient`, client secret `secret`, redirect
+        desktop client uses client id `rushfiles.PCClient`, redirect
         `rushfiles://signedin`, and scope `openid profile domain_api offline_access`.
         It also sends `acr_values` of
         `localAuth:False deviceId:{id} deviceName:{name} deviceType:0 deviceOs:{os}`, with each
         value URL-encoded. Access tokens
-        last 5 minutes on rushfiles.one, so long-running clients refresh about every 4. Whether
-        refresh tokens rotate is unknown, so processes sharing a login should share its tokens.
+        last 5 minutes on rushfiles.one, so long-running clients refresh about every 4. Refresh
+        tokens do not rotate. This is a public client: login and refresh work without a client
+        secret, though the Windows client sends the value `secret`.
       openIdConnectUrl: https://auth.rushfiles.com/.well-known/openid-configuration
   parameters:
     userId:
