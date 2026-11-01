@@ -1,0 +1,1194 @@
+openapi: 3.1.0
+info:
+  title: RushFiles Client API (unofficial)
+  version: 2.0.1-reverse-engineered
+  summary: API used by the RushFiles desktop client, reconstructed from Windows client v2.0.1.
+  description: |
+    Unofficial description, derived from the decompiled Windows client. It is not published
+    or supported by RushFiles A/S and covers only what that client calls, so the server may
+    offer more than is listed here.
+
+    **How far to trust it**
+
+    - `x-source` names the decompiled method an operation comes from.
+    - `x-verified-live: true` marks operations seen working against a production server
+      (`rushfiles.one`). Everything else is inferred from client code and has never been
+      exercised live. Write operations were verified by using a mount and checking the result
+      in the web UI, so their response bodies were not inspected.
+    - HTTP status codes other than the ones the client checks for are unknown.
+
+    **Hosts.** Each user has one or more domains, for example `rushfiles.one`, listed in the
+    `primary_domain` and `domains` access token claims. Every share belongs to one domain.
+    Metadata lives on `clientgateway.{domain}`, file content on `filecache01.{domain}`, and
+    realtime events on `clientgatewayapi.{domain}`.
+
+    **JSON.** Property names are PascalCase, in requests and in the `catchup` and `virtualFiles`
+    responses seen on a live server. The client reads responses case-insensitively, so other
+    responses may differ.
+    Misspellings such as
+    `ParrentId`, `FilehHash`, `ClientJournalEventType` and `ReciveEnvelope` are part of the
+    protocol. Enums are integers.
+
+    **Identifiers.** Ids appear both as 32 hex digits and as dashed GUIDs, also among shares on
+    one server, so compare them with dashes removed and in lower case. A file has two ids:
+    `InternalName` identifies the file, and `UploadName` identifies one version of its content.
+    Downloads take `UploadName`; all other file calls take `InternalName`.
+
+    **Journal events.** All changes go through `/api/shares/{shareId}/files` as a
+    `PutClientJournal`, with the kind of change given by `ClientJournalEventType`:
+
+    | Change | Request | Event |
+    | --- | --- | --- |
+    | Create file or folder | `POST /files` | `Create` (0) |
+    | New file content | `PUT /files/{id}` | `Update` (3) |
+    | Rename | `PUT /files/{id}` | `Rename` (2) |
+    | Move | `PUT /files/{id}` | `Move` (16) |
+    | Lock, unlock | `PUT /files/{id}` | `LockFile` (13), `UnlockFile` (14) |
+    | Delete | `DELETE /files/{id}` | `Delete` (1) |
+
+    **Upload flow.** Send a `Create` or `Update` with `EndOfFile` set to the size. If the size
+    is not zero, the response has a `Url`; send the content there in chunks (see
+    `uploadContentChunk`). Folders have `Attributes` 16 and no content.
+
+    **Root folders.** The parent id of a top-level item is the share id or, for a subshare, the
+    share's `VirtualFileId`.
+
+    **Change tracking.** `/api/client/catchup` returns rows changed since a tick, and SignalR
+    pushes changes as they happen (see `x-signalr`). Polling `catchup` also works: a call with
+    no changes returned about 100 bytes and took about 0.4 seconds live.
+
+    **Locks.** A file lock binds other users only. Its holder can keep working, on any device,
+    as the lock records a user and no device. Share owners and company admins can unlock any
+    file but are otherwise bound like everyone else. The client enforces this itself before
+    changes; `FileIsLocked` is the server's own check on uploads. A live edit by the lock's
+    holder was accepted. A lock by another user has not been tried live.
+  license:
+    name: Unofficial; no license granted by RushFiles A/S
+    identifier: LicenseRef-Unofficial
+x-signalr:
+  description: Realtime events. Not an HTTP API, so described here instead of under paths.
+  selection: |
+    Probe GET https://clientgatewayapi.{domain}/signalr/health. A success status means use the
+    core hub; anything else means use the legacy hub. rushfiles.one answered 400 when probed,
+    so that server gets the legacy hub. Neither hub has been exercised live.
+  core:
+    url: https://clientgatewayapi.{domain}/signalr/rfhub
+    protocol: ASP.NET Core SignalR
+    auth: Access token through the SignalR AccessTokenProvider
+  legacy:
+    url: https://clientgateway.{domain}
+    protocol: ASP.NET SignalR 2, hub name RfHub
+    auth: Cookie .ASPXAUTH holding ClientLogin.Cookie from /api/client/fullprofile
+  serverToClient:
+    ReciveEnvelope:
+      payload: '#/components/schemas/Envelope'
+      note: Envelope.Message is a JSON string holding a ClientJournalEvent.
+  clientToServer:
+    SendMessage:
+      payload: '#/components/schemas/Envelope'
+      note: |
+        Sent after connecting and after each reconnect, with MessageType 2 (Online), RnaSender
+        set to the user id, and Message holding a JSON HubOnlineMessage.
+  source: CoreSignalRClient, SignalRClient, HubTransportSelector
+servers:
+  - url: https://clientgateway.{domain}
+    description: Client gateway (metadata). Operations on other hosts override this.
+    variables:
+      domain:
+        default: rushfiles.one
+        description: A domain from the user's token claims.
+security:
+  - oidc: [openid, profile, domain_api, offline_access]
+tags:
+  - name: Users
+  - name: Shares
+  - name: Sync
+  - name: Files
+    description: File content and journal events, on the file cache host.
+  - name: Links
+  - name: Server
+paths:
+  /api/users/{userId}/shares:
+    parameters:
+      - $ref: '#/components/parameters/userId'
+    get:
+      operationId: getUserShares
+      tags: [Shares]
+      summary: List the user's shares
+      x-source: ClientGatewayService.GetUserSharesAsync
+      x-verified-live: true
+      parameters:
+        - name: includeAssociations
+          in: query
+          required: true
+          description: The Windows client sends `False`, the .NET form of the boolean.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Shares
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareList'
+  /api/users/{userId}/companies:
+    parameters:
+      - $ref: '#/components/parameters/userId'
+    get:
+      operationId: getUserCompanies
+      tags: [Users]
+      summary: List the user's companies
+      x-source: ClientGatewayService.GetUserCompaniesAsync
+      responses:
+        '200':
+          description: Companies
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompanyList'
+  /api/users/{userId}/userprofile:
+    parameters:
+      - $ref: '#/components/parameters/userId'
+    get:
+      operationId: getUserProfile
+      tags: [Users]
+      summary: Get a user's profile
+      x-source: ClientGatewayService.GetUserAsync
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+  /api/users/{userId}/devices:
+    parameters:
+      - $ref: '#/components/parameters/userId'
+    get:
+      operationId: getUserDevices
+      tags: [Users]
+      summary: List the user's devices and their approval status
+      x-source: ClientGatewayService.GetUserDevices
+      responses:
+        '200':
+          description: Devices
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceList'
+  /api/client/fullprofile:
+    get:
+      operationId: getFullProfile
+      tags: [Sync]
+      summary: Get the managed shares, groups and hub cookie
+      description: Source of the per-share `AclToken` that `catchup` needs.
+      x-source: ClientGatewayService.GetFullProfileAsync
+      x-verified-live: true
+      parameters:
+        - name: tick
+          in: query
+          required: true
+          description: The client always sends 1.
+          schema:
+            type: integer
+        - name: api
+          in: query
+          required: true
+          description: The client always sends 1.
+          schema:
+            type: integer
+        - name: associationRequired
+          in: query
+          required: true
+          description: The client always sends false.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClientLoginResponse'
+  /api/client/catchup:
+    get:
+      operationId: catchup
+      tags: [Sync]
+      summary: Get rows changed in a share since a tick
+      description: |
+        Paginate by repeating with `tickFrom` set to the previous `LargestTick` until it reaches
+        `ShareTick`, and stop if it does not advance. This response is not wrapped in `Data`.
+
+        Deleted rows are returned as tombstones with `Deleted` true, according to the client;
+        none has been seen live. Permanent deletes leave no row, only a gap: `ShareTick` minus
+        the starting tick exceeds the number of distinct rows returned. The client then fetches
+        a full listing from tick 0 and removes what it no longer contains, unless that listing
+        is empty.
+
+        Rows cost the server about 2 ms each, so a first sync of a 28,000 row share took over a
+        minute. A gzip-only request came back uncompressed; the client also offers brotli, which
+        is untested. `Path`, `SubShareIds`, `NoOfChildren`, `AllocationSize`, `Local`,
+        `IsOffline`, `HasHistory`, `InRetension` and the timestamp fields for deletion and
+        retention were empty or zero in every row of a 1,017 row sample. `FilehHash` was absent,
+        so `UploadName` is the way to detect a content change.
+      x-source: ClientGatewayService.CatchupAsync, SyncVirtualFilesCommandHandler
+      x-verified-live: true
+      parameters:
+        - name: token
+          in: query
+          required: true
+          description: '`ShareAcl.AclToken` for this share, from `getFullProfile`.'
+          schema:
+            type: string
+        - name: shareId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: tickFrom
+          in: query
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - name: tickTake
+          in: query
+          required: true
+          description: Batch size. The client uses 10000.
+          schema:
+            type: integer
+            format: int64
+        - name: tickStart
+          in: query
+          required: true
+          description: The batch start, or 0 throughout a full catch-up.
+          schema:
+            type: integer
+            format: int64
+      responses:
+        '200':
+          description: Changed rows
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Catchup'
+  /api/shares/{shareId}/virtualfiles/{parentId}/children:
+    parameters:
+      - $ref: '#/components/parameters/shareId'
+      - name: parentId
+        in: path
+        required: true
+        description: A folder's `InternalName`, or the share's root id.
+        schema:
+          type: string
+    get:
+      operationId: getVirtualFileChildren
+      tags: [Shares]
+      summary: List a folder's children
+      x-source: ClientGatewayService.GetVirtualFileChildrenAsync
+      x-verified-live: true
+      parameters:
+        - name: includeAssociations
+          in: query
+          required: true
+          description: The client always sends false.
+          schema:
+            type: boolean
+        - name: includeDeleted
+          in: query
+          required: true
+          description: The client always sends false.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Children
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VirtualFileList'
+  /api/shares/{shareId}/virtualFiles/{virtualFileId}:
+    parameters:
+      - $ref: '#/components/parameters/shareId'
+      - $ref: '#/components/parameters/virtualFileId'
+    get:
+      operationId: getVirtualFile
+      tags: [Shares]
+      summary: Get one file or folder record
+      description: The capital F differs from the `children` route; this is how the client spells it.
+      x-source: ClientGatewayService.GetVirtualFileAsync
+      x-verified-live: true
+      responses:
+        '200':
+          description: Record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VirtualFileResponse'
+        '404':
+          description: No such file
+  /api/publiclinks:
+    post:
+      operationId: createPublicLink
+      tags: [Links]
+      summary: Create a public link
+      x-source: ClientGatewayService.CreatePublicLinkAsync
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePublicLink'
+      responses:
+        '201':
+          description: Link created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicLinkResultResponse'
+  /api/settings:
+    get:
+      operationId: getServerSettings
+      tags: [Server]
+      summary: Get the server version
+      x-source: ClientGatewayService.GetServerSettingsAsync
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerSettingsResponse'
+  /api/shares/{shareId}/files:
+    servers:
+      - url: https://filecache01.{domain}
+        description: File cache (content and journal events).
+        variables:
+          domain:
+            default: rushfiles.one
+    parameters:
+      - $ref: '#/components/parameters/shareId'
+    post:
+      operationId: createFile
+      tags: [Files]
+      summary: Create a file or folder
+      description: Send a `Create` event with an empty `InternalName`.
+      x-source: FileCacheService.UploadFileMetadata, ClientJournalEventUtility.PrepareDataForUpload
+      x-verified-live: true
+      requestBody:
+        $ref: '#/components/requestBodies/Journal'
+      responses:
+        default:
+          $ref: '#/components/responses/JournalResult'
+  /api/shares/{shareId}/files/{fileId}:
+    servers:
+      - url: https://filecache01.{domain}
+        description: File cache (content and journal events).
+        variables:
+          domain:
+            default: rushfiles.one
+    parameters:
+      - $ref: '#/components/parameters/shareId'
+      - name: fileId
+        in: path
+        required: true
+        description: A version's `UploadName` for GET, or the file's `InternalName` for PUT and DELETE.
+        schema:
+          type: string
+    get:
+      operationId: downloadFile
+      tags: [Files]
+      summary: Download one version of a file
+      description: The path id is `UploadName`. Passing `InternalName` returned 404 on a live server.
+      x-source: FileCacheService.GetFileAsync, OnFetchDataDelegate
+      x-verified-live: true
+      responses:
+        '200':
+          description: File content
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+    put:
+      operationId: updateFile
+      tags: [Files]
+      summary: Apply an Update, Rename, Move, LockFile or UnlockFile event
+      description: |
+        Verified live for Update, Rename and Move; LockFile and UnlockFile are not.
+
+        Rename and Move send the file's full record with `PublicName` or `ParrentId` changed.
+        `Path` and `NewPath` carry the Windows client's local paths. Whether the server uses
+        them is unknown.
+      x-source: FileCacheService.UploadFileMetadata, RenameFileAsync, MoveFileAsync, LockOrUnlockFileAsync
+      x-verified-live: true
+      requestBody:
+        $ref: '#/components/requestBodies/Journal'
+      responses:
+        default:
+          $ref: '#/components/responses/JournalResult'
+    delete:
+      operationId: deleteFile
+      tags: [Files]
+      summary: Delete a file or folder
+      description: The body is a `Delete` event. Deleting a folder is assumed to remove its contents.
+      x-source: FileCacheService.DeleteFileAsync
+      x-verified-live: true
+      requestBody:
+        $ref: '#/components/requestBodies/Journal'
+      responses:
+        default:
+          $ref: '#/components/responses/JournalResult'
+  /{uploadUrl}:
+    servers:
+      - url: https://filecache01.{domain}
+        description: File cache (content and journal events).
+        variables:
+          domain:
+            default: rushfiles.one
+    parameters:
+      - name: uploadUrl
+        in: path
+        required: true
+        description: |
+          Placeholder for the opaque `Url` from a journal response. Use that value as given,
+          resolved against the file cache host; it is not a route you build yourself.
+        schema:
+          type: string
+    put:
+      operationId: uploadContentChunk
+      tags: [Files]
+      summary: Upload a chunk of file content
+      description: |
+        Send chunks of up to 10 MiB (10485760 bytes) in order. The last response holds the
+        finished file record. The client does not retry a chunk on overload.
+      x-source: FileCacheService.UploadChunkAsync
+      x-verified-live: true
+      parameters:
+        - name: Content-Range
+          in: header
+          required: true
+          description: For example `bytes 0-10485759/25000000`.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Chunk stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JournalResponse'
+  /signalr/health:
+    servers:
+      - url: https://clientgatewayapi.{domain}
+        variables:
+          domain:
+            default: rushfiles.one
+    get:
+      operationId: getHubHealth
+      tags: [Server]
+      summary: Probe for the core SignalR hub
+      description: The client calls this without a token, with a 3 second timeout.
+      x-source: HubTransportSelector.Probe
+      x-verified-live: true
+      security: []
+      responses:
+        '200':
+          description: Core hub available
+        '400':
+          description: Seen from rushfiles.one. Any non-success status selects the legacy hub.
+components:
+  securitySchemes:
+    oidc:
+      type: openIdConnect
+      description: |
+        Authorization code flow with PKCE (S256) against `https://auth.rushfiles.com`. The
+        desktop client uses client id `rushfiles.PCClient`, client secret `secret`, redirect
+        `rushfiles://signedin`, and scope `openid profile domain_api offline_access`.
+        It also sends `acr_values` of
+        `localAuth:False deviceId:{id} deviceName:{name} deviceType:0 deviceOs:{os}`, with each
+        value URL-encoded. Login, token exchange and refresh are verified live. Access tokens
+        last 5 minutes on rushfiles.one, so long-running clients refresh about every 4. Whether
+        refresh tokens rotate is unknown, so processes sharing a login should share its tokens.
+      openIdConnectUrl: https://auth.rushfiles.com/.well-known/openid-configuration
+  parameters:
+    userId:
+      name: userId
+      in: path
+      required: true
+      description: The `sub` claim of the access token.
+      schema:
+        type: string
+    shareId:
+      name: shareId
+      in: path
+      required: true
+      schema:
+        type: string
+    virtualFileId:
+      name: virtualFileId
+      in: path
+      required: true
+      description: The file's `InternalName`.
+      schema:
+        type: string
+  requestBodies:
+    Journal:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PutClientJournal'
+  responses:
+    JournalResult:
+      description: |
+        Outcome of a journal event. Read `Code` as well as the HTTP status: refusals such as
+        `DeniedAccess` or `FileIsLocked` are reported there. The client treats only a 400 on
+        move, and a non-200/201 on lock, as HTTP-level failures.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/JournalResponse'
+  schemas:
+    ShareList:
+      type: object
+      properties:
+        Data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Share'
+        Message:
+          type: [string, 'null']
+    CompanyList:
+      type: object
+      properties:
+        Data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Company'
+        Message:
+          type: [string, 'null']
+    DeviceList:
+      type: object
+      properties:
+        Data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+        Message:
+          type: [string, 'null']
+    VirtualFileList:
+      type: object
+      properties:
+        Data:
+          type: array
+          items:
+            $ref: '#/components/schemas/VirtualFile'
+        Message:
+          type: [string, 'null']
+    UserResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/User'
+        Message:
+          type: [string, 'null']
+    ClientLoginResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/ClientLogin'
+        Message:
+          type: [string, 'null']
+    VirtualFileResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/VirtualFile'
+        Message:
+          type: [string, 'null']
+    PublicLinkResultResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/PublicLinkResult'
+        Message:
+          type: [string, 'null']
+    ServerSettingsResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/ServerSettings'
+        Message:
+          type: [string, 'null']
+    JournalResponse:
+      type: object
+      properties:
+        Data:
+          $ref: '#/components/schemas/UploadClientJournalResponse'
+        Message:
+          type: [string, 'null']
+        Code:
+          $ref: '#/components/schemas/FileResponseCode'
+    UploadClientJournalResponse:
+      type: object
+      properties:
+        ClientJournalEvent:
+          $ref: '#/components/schemas/PutClientJournal'
+        IsLargeFile:
+          type: boolean
+        Url:
+          type: [string, 'null']
+          description: Where to upload content.
+    PutClientJournal:
+      type: object
+      required: [TransmitId, ClientJournalEventType, DeviceId, RfVirtualFile]
+      properties:
+        TransmitId:
+          type: string
+          description: A new GUID per event.
+        TransmitTimeout:
+          type: string
+          description: The client leaves this at the .NET default, `0001-01-01T00:00:00`.
+        ClientJournalEventType:
+          $ref: '#/components/schemas/ClientJournalEventType'
+        DeviceId:
+          type: string
+        RfVirtualFile:
+          $ref: '#/components/schemas/VirtualFile'
+    ClientJournalEvent:
+      type: object
+      description: Pushed over SignalR as a JSON string in `Envelope.Message`.
+      properties:
+        TransmitId:
+          type: string
+        TransmitTimeout:
+          type: string
+        ClientJournalEventType:
+          $ref: '#/components/schemas/ClientJournalEventType'
+        DeviceId:
+          type: string
+        UserOrigin:
+          type: string
+        VShare:
+          type: string
+        ShareTick:
+          type: integer
+        TransmitCounter:
+          type: integer
+        RfVirtualFile:
+          $ref: '#/components/schemas/VirtualFile'
+        CreateTick:
+          type: integer
+    VirtualFile:
+      type: object
+      properties:
+        InternalName:
+          type: [string, 'null']
+          description: File id. Empty on create.
+        UploadName:
+          type: [string, 'null']
+          description: Content version id, used for downloads.
+        PublicName:
+          type: string
+          description: Display name, in Unicode NFC.
+        User:
+          type: [string, 'null']
+          description: |
+            A user id, the `sub` claim. Matched the owner's `sub` on the record checked live.
+            Whether it means creator or last editor is unknown.
+        IsFile:
+          type: boolean
+          description: Not set by the client on create; it sends `Attributes` instead.
+        FileLock:
+          oneOf:
+            - $ref: '#/components/schemas/FileLock'
+            - type: 'null'
+        Path:
+          type: [string, 'null']
+        NewPath:
+          type: [string, 'null']
+        ShareId:
+          type: string
+        ShareTick:
+          type: integer
+        Tick:
+          type: [integer, 'null']
+        SubShareIds:
+          type: [array, 'null']
+          items:
+            type: string
+        ParrentId:
+          type: string
+        EndOfFile:
+          type: [integer, 'null']
+          format: int64
+          description: Size in bytes.
+        CreationTime:
+          type: [string, 'null']
+          format: date-time
+          description: The file's own creation time as sent by the client, not the upload time.
+        LastAccessTime:
+          type: [string, 'null']
+          format: date-time
+        LastWriteTime:
+          type: [string, 'null']
+          format: date-time
+          description: The file's own modified time, so copies can carry old dates.
+        Attributes:
+          type: [integer, 'null']
+          description: System.IO.FileAttributes flags, such as 16 for a folder or 128 for a normal file.
+        Deleted:
+          type: boolean
+        FilehHash:
+          type: [string, 'null']
+        CopyLargeFileStatus:
+          oneOf:
+            - $ref: '#/components/schemas/CopyLargeFileStatus'
+            - type: 'null'
+        LocalVirtualFileId:
+          type: [string, 'null']
+        UpdateTick:
+          type: integer
+          description: Seen in live `catchup` rows; not in the client's DTO, as are the fields below.
+        CreateTick:
+          type: integer
+        NoOfChildren:
+          type: integer
+          description: 0 in every live row sampled.
+        AllocationSize:
+          type: integer
+          format: int64
+        Local:
+          type: boolean
+        IsOffline:
+          type: boolean
+        HasHistory:
+          type: boolean
+        DeleteTimestamp:
+          type: integer
+          format: int64
+        RetensionTimestamp:
+          type: integer
+          format: int64
+        InRetension:
+          type: boolean
+    FileLock:
+      type: object
+      properties:
+        IsLocked:
+          type: boolean
+        LockTime:
+          type: integer
+          format: int64
+        LockedBy:
+          type: [string, 'null']
+          description: A user id, the `sub` claim. Live, only present on locked files.
+    Catchup:
+      type: object
+      properties:
+        RfVirtualFiles:
+          type: array
+          items:
+            $ref: '#/components/schemas/VirtualFile'
+        ShareTick:
+          type: integer
+          format: int64
+        LargestTick:
+          type: integer
+          format: int64
+        FullCatchup:
+          type: boolean
+    Share:
+      type: object
+      properties:
+        AclToken:
+          type: [string, 'null']
+          description: The client takes this token from `getFullProfile` instead.
+        AclType:
+          oneOf:
+            - $ref: '#/components/schemas/ACLType'
+            - type: 'null'
+        Id:
+          type: string
+        CompanyId:
+          type: [string, 'null']
+        CompanyName:
+          type: [string, 'null']
+        VirtualFileId:
+          type: [string, 'null']
+        Name:
+          type: string
+        ShareDefault:
+          $ref: '#/components/schemas/ShareDefault'
+        ShareTick:
+          type: integer
+        SpaceUsage:
+          $ref: '#/components/schemas/SpaceUsage'
+        Limits:
+          $ref: '#/components/schemas/ShareLimits'
+        ShareType:
+          $ref: '#/components/schemas/ShareType'
+        ShareIds:
+          type: [array, 'null']
+          items:
+            type: string
+        ParentShareId:
+          type: [string, 'null']
+        TimeStamps:
+          $ref: '#/components/schemas/TimeStamps'
+        PublicLinkSettings:
+          $ref: '#/components/schemas/SharePublicLinkSettings'
+        ShareAssociationType:
+          $ref: '#/components/schemas/ShareAssociationType'
+        Domain:
+          type: [string, 'null']
+        LocalName:
+          type: [string, 'null']
+    ShareDefault:
+      type: object
+      properties:
+        Owner:
+          type: [string, 'null']
+        ShareCategory:
+          $ref: '#/components/schemas/ShareCategory'
+    SpaceUsage:
+      type: object
+      properties:
+        DiskUsage:
+          type: integer
+          format: int64
+        HistoryUsage:
+          type: integer
+          format: int64
+        DeletedUsage:
+          type: integer
+          format: int64
+    ShareLimits:
+      type: object
+      properties:
+        MaxStorage:
+          type: integer
+        Unlimited:
+          type: boolean
+        HardLimit:
+          type: boolean
+    TimeStamps:
+      type: object
+      properties:
+        CreateTime:
+          type: integer
+          format: int64
+        CreatedBy:
+          type: [string, 'null']
+        UpdateTime:
+          type: integer
+          format: int64
+        UpdatedBy:
+          type: [string, 'null']
+        DeleteTime:
+          type: integer
+          format: int64
+        DeletedBy:
+          type: [string, 'null']
+    SharePublicLinkSettings:
+      type: object
+      properties:
+        ApprovalEnabled:
+          type: boolean
+    Company:
+      type: object
+      properties:
+        Id:
+          type: string
+        Name:
+          type: string
+        CompanyDefault:
+          $ref: '#/components/schemas/CompanyDefault'
+        PublicLinkSettings:
+          $ref: '#/components/schemas/PublicLinkSettings'
+        AssociationType:
+          $ref: '#/components/schemas/AssociationType'
+    CompanyIdentity:
+      type: object
+      properties:
+        Id:
+          type: string
+        Name:
+          type: string
+    CompanyDefault:
+      type: object
+      properties:
+        EnforceDefault:
+          type: boolean
+        HardLimitPrivateShare:
+          type: boolean
+        PublicLinkExpireDefault:
+          type: integer
+        PublicLinkDownloadLimit:
+          type: integer
+    PublicLinkSettings:
+      type: object
+      properties:
+        Enabled:
+          type: boolean
+    User:
+      type: object
+      properties:
+        Id:
+          type: string
+        Email:
+          type: [string, 'null']
+        AltEmail:
+          type: [string, 'null']
+        FirstName:
+          type: [string, 'null']
+        LastName:
+          type: [string, 'null']
+        LastLoginTime:
+          type: integer
+          format: int64
+        ProfilePicture:
+          type: [string, 'null']
+        HaveProfilePicture:
+          type: boolean
+        Company:
+          type: [string, 'null']
+        Title:
+          type: [string, 'null']
+        Telephone:
+          type: [string, 'null']
+        AdUser:
+          type: [string, 'null']
+        PrimaryCompany:
+          $ref: '#/components/schemas/CompanyIdentity'
+        Domains:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/Claim'
+    Claim:
+      type: object
+      properties:
+        Domain:
+          type: string
+        IsPrimary:
+          type: boolean
+    Device:
+      type: object
+      properties:
+        DeviceId:
+          type: string
+        Status:
+          $ref: '#/components/schemas/DeviceStatus'
+    ClientLogin:
+      type: object
+      properties:
+        Cookie:
+          type: [string, 'null']
+          description: Value of the `.ASPXAUTH` cookie for the legacy hub.
+        ManagedShares:
+          type: array
+          items:
+            $ref: '#/components/schemas/ManagedShare'
+        Groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/Group'
+    ManagedShare:
+      type: object
+      properties:
+        ShareId:
+          type: string
+        ShareName:
+          type: string
+        ShareAcl:
+          $ref: '#/components/schemas/ShareAcl'
+        CompanyName:
+          type: [string, 'null']
+        ShareType:
+          $ref: '#/components/schemas/ShareType'
+        ParentShareId:
+          type: [string, 'null']
+    ShareAcl:
+      type: object
+      properties:
+        ShareId:
+          type: string
+        AclType:
+          $ref: '#/components/schemas/ACLType'
+        ShareShareRights:
+          $ref: '#/components/schemas/ShareShareRights'
+        FileShareRights:
+          $ref: '#/components/schemas/FileShareRights'
+        AclToken:
+          type: string
+          description: Passed as `token` to `catchup`.
+        ByUserId:
+          type: [string, 'null']
+    Group:
+      type: object
+      properties:
+        GroupId:
+          type: string
+        GroupName:
+          type: string
+        Owner:
+          type: [string, 'null']
+    CreatePublicLink:
+      type: object
+      properties:
+        ShareId:
+          type: string
+        InternalName:
+          type: string
+        DaysToExpire:
+          type: integer
+        DownloadLimit:
+          type: integer
+        UploadLimit:
+          type: [integer, 'null']
+        Message:
+          type: [string, 'null']
+        EnablePassword:
+          type: boolean
+        Password:
+          type: [string, 'null']
+        PublicLinkType:
+          $ref: '#/components/schemas/LinkTypes'
+        Collaborators:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/Collaborator'
+        SharingOptions:
+          $ref: '#/components/schemas/LinkSharingOptions'
+        AllowDeletes:
+          type: boolean
+        AllowRenames:
+          type: boolean
+    Collaborator:
+      type: object
+      properties:
+        Email:
+          type: string
+    PublicLinkResult:
+      type: object
+      properties:
+        FullLink:
+          type: string
+    ServerSettings:
+      type: object
+      properties:
+        Version:
+          type: string
+    Envelope:
+      type: object
+      description: SignalR message wrapper. See `x-signalr`.
+      properties:
+        MessageType:
+          $ref: '#/components/schemas/MessageType'
+        RnaReciver:
+          type: [string, 'null']
+        RnaSender:
+          type: [string, 'null']
+        SendTime:
+          type: string
+          format: date-time
+        ReSendTime:
+          type: string
+          format: date-time
+        ReSendInterval:
+          type: integer
+        ReSendCount:
+          type: integer
+        Message:
+          type: string
+          description: A JSON string, parsed separately.
+        Origin:
+          $ref: '#/components/schemas/Origin'
+        ChannelId:
+          type: [string, 'null']
+        Data: {}
+    HubOnlineMessage:
+      type: object
+      description: Carried as a JSON string in `Envelope.Message` when going online.
+      properties:
+        UserId:
+          type: string
+        ClientType:
+          type: integer
+          description: The client always sends 2.
+        ShareList:
+          type: array
+          items:
+            type: string
+        GroupList:
+          type: array
+          items:
+            type: string
+    ClientJournalEventType:
+      type: integer
+      enum: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+      x-enum-varnames: [Create, Delete, Rename, Update, FileAttributes, CatchUp, Duplicate, ConflictNewVersion, FileNotPressent, IgnoreDelete, RenameConflict, Recover, Undelete, LockFile, UnlockFile, Copy, Move, DeletePermanently]
+    FileResponseCode:
+      type: integer
+      enum: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+      x-enum-varnames: [DeniedAccess, Success, Conflict, Duplicate, NoRequest, NotYetImplemented, InsufficientData, AlreadyExist, FailedTalkingToServer, IgnoreDelete, EntityNotFound, StorageLimitExceeded, IllegalCharacters, ParentNotFound, JournalAlreadyExists, FileIsLocked, BadRange, MissingCreateEvent, LargeFile, EndsWithDot]
+    CopyLargeFileStatus:
+      type: integer
+      enum: [0, 1, 2, 3]
+      x-enum-varnames: [New, InProgress, Completed, Failed]
+    ACLType:
+      type: integer
+      enum: [0, 1, 2]
+      x-enum-varnames: [Read, Write, Owner]
+    ShareAssociationType:
+      type: integer
+      enum: [0, 1, 2]
+      x-enum-varnames: [Read, Write, Owner]
+    AssociationType:
+      type: integer
+      enum: [0, 1, 2]
+      x-enum-varnames: [External, Internal, Admin]
+    ShareType:
+      type: integer
+      enum: [0, 1]
+      x-enum-varnames: [Normal, SubShare]
+    ShareCategory:
+      type: integer
+      enum: [0, 1, 2, 3]
+      x-enum-varnames: [Corporate, Team, Private, Default]
+    ShareShareRights:
+      type: integer
+      enum: [0, 1, 2]
+      x-enum-varnames: [ShareInternal, ShareExternal, None]
+    FileShareRights:
+      type: integer
+      enum: [0, 1]
+      x-enum-varnames: [ShareInternal, ShareExternal]
+    DeviceStatus:
+      type: integer
+      enum: [0, 1, 2, 3]
+      x-enum-varnames: [Unapproved, Approved, BlockedByOwner, BlockedByAdmin]
+    LinkTypes:
+      type: integer
+      enum: [0, 1, 2, 3, 4]
+      x-enum-varnames: [PreviewDownload, Preview, Download, Upload, Sharing]
+    LinkSharingOptions:
+      type: integer
+      enum: [0, 1]
+      x-enum-varnames: [AnyoneWithLink, CollaboratorsOnly]
+    MessageType:
+      type: integer
+      enum: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      x-enum-varnames: [Journal, Responce, Online, BroadCast, ArchiveFile, CacheFile, ArchiveFileResponce, CatchUp, ShareAdded, ShareRemoved, GroupAdded, GroupRemoved, DomainEvent]
+    Origin:
+      type: integer
+      enum: [0]
+      x-enum-varnames: [VShare]
