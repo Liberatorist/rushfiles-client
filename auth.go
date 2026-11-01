@@ -112,6 +112,9 @@ func acrValues(device string) string {
 		" deviceName:" + url.QueryEscape(host) + " deviceType:0 deviceOs:Linux"
 }
 
+// errLoginRejected means the server refused the login, as opposed to being unreachable.
+var errLoginRejected = errors.New("login rejected")
+
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -137,7 +140,7 @@ func requestToken(ctx context.Context, form url.Values) (*tokenResponse, error) 
 		return nil, fmt.Errorf("token endpoint returned %s: %w", resp.Status, err)
 	}
 	if out.Error != "" {
-		return nil, fmt.Errorf("token endpoint: %s", out.Error)
+		return nil, fmt.Errorf("%w: %s", errLoginRejected, out.Error)
 	}
 	if out.AccessToken == "" {
 		return nil, fmt.Errorf("token endpoint returned %s without an access token", resp.Status)
@@ -163,6 +166,13 @@ func (s *tokenSource) get(ctx context.Context, rejected string) (string, error) 
 	defer s.mu.Unlock()
 	if s.t.AccessToken != rejected && time.Until(s.t.Expiry) > time.Minute {
 		return s.t.AccessToken, nil
+	}
+	// Another process may have refreshed since, and that can void our refresh token.
+	if f, err := loadTokens(); err == nil && f.RefreshToken != "" && f.AccessToken != s.t.AccessToken {
+		s.t.AccessToken, s.t.RefreshToken, s.t.Expiry = f.AccessToken, f.RefreshToken, f.Expiry
+		if s.t.AccessToken != rejected && time.Until(s.t.Expiry) > time.Minute {
+			return s.t.AccessToken, nil
+		}
 	}
 	out, err := requestToken(ctx, url.Values{"grant_type": {"refresh_token"}, "refresh_token": {s.t.RefreshToken}})
 	if err != nil {

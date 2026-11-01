@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -29,7 +30,10 @@ const usage = `usage:
 
 mount options:
   --rw                allow changes to be written to the server
-  --list-ttl 15s      how long folder listings are reused; remote changes appear after this
+  --sync-interval 30s how often to fetch remote changes for the local file tree
+  --no-sync           keep no local tree; list folders live from the server instead
+  --trim-interval 5m  how often to free memory held for paths nothing is using; 0 turns it off
+  --list-ttl 15s      how long live listings are reused, before the tree is ready or with --no-sync
   --cache-gb 10       local download cache limit
 
 autostart options:
@@ -59,6 +63,9 @@ func main() {
 		}
 	case "logout":
 		err = os.Remove(tokenPath())
+		if treeErr := os.RemoveAll(treeDir()); err == nil {
+			err = treeErr
+		}
 	case "shares":
 		err = listShares(ctx)
 	case "mount":
@@ -81,6 +88,29 @@ func main() {
 	}
 }
 
+// trimLoop keeps memory from tracking how much of the drive has ever been visited.
+func trimLoop(ctx context.Context, root *node, every time.Duration) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if root.trim() < trimWorthFreeing {
+			continue
+		}
+		// The kernel's forgets arrive shortly after; hand the memory back once they have.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(trimSettle):
+			debug.FreeOSMemory()
+		}
+	}
+}
+
 func listShares(ctx context.Context) error {
 	c, err := newAPIClient(true)
 	if err != nil {
@@ -96,10 +126,23 @@ func listShares(ctx context.Context) error {
 	return nil
 }
 
+// gcPercent trades a little CPU for a smaller heap. The mount is idle most of the
+// time, so collections are rare either way.
+const gcPercent = 25
+
+const (
+	trimWorthFreeing = 1000
+	trimSettle       = 2 * time.Second
+)
+
 func mount(ctx context.Context, args []string) error {
+	debug.SetGCPercent(gcPercent)
 	flags := flag.NewFlagSet("mount", flag.ContinueOnError)
 	rw := flags.Bool("rw", false, "allow changes to be written to the server")
-	ttl := flags.Duration("list-ttl", 15*time.Second, "folder listing lifetime")
+	ttl := flags.Duration("list-ttl", 15*time.Second, "live folder listing lifetime")
+	interval := flags.Duration("sync-interval", 30*time.Second, "how often to fetch remote changes")
+	noSync := flags.Bool("no-sync", false, "keep no local file tree")
+	trimEvery := flags.Duration("trim-interval", 5*time.Minute, "how often to free memory for unused paths")
 	cacheGB := flags.Int64("cache-gb", 10, "download cache limit in GiB")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -119,13 +162,19 @@ func mount(ctx context.Context, args []string) error {
 	if err := os.MkdirAll(filepath.Join(opts.cacheDir, "work"), 0o700); err != nil {
 		return err
 	}
+	if !*noSync {
+		if opts.sync, err = newTreeSync(c, *interval); err != nil {
+			return err
+		}
+	}
 	mountOpts := []string{"default_permissions"}
 	if !*rw {
 		mountOpts = append(mountOpts, "ro")
 	}
 	entry, attr := 5*time.Second, 5*time.Second
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	server, err := fs.Mount(dir, &node{c: c, opts: opts}, &fs.Options{
+	root := &node{c: c, opts: opts}
+	server, err := fs.Mount(dir, root, &fs.Options{
 		EntryTimeout: &entry, AttrTimeout: &attr, UID: uid, GID: gid,
 		MountOptions: fuse.MountOptions{FsName: "rushfiles", Name: "rushfiles", Options: mountOpts, MaxWrite: 1 << 20},
 	})
@@ -143,6 +192,19 @@ func mount(ctx context.Context, args []string) error {
 			log.Printf("unmount: %v (files still open?)", err)
 		}
 	}()
+	synced := make(chan struct{})
+	syncCtx, stopSync := context.WithCancel(context.Background())
+	go func() {
+		defer close(synced)
+		if opts.sync != nil {
+			opts.sync.run(syncCtx)
+		}
+	}()
+	if *trimEvery > 0 {
+		go trimLoop(syncCtx, root, *trimEvery)
+	}
 	server.Wait()
+	stopSync()
+	<-synced
 	return nil
 }

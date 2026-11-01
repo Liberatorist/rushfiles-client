@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,8 @@ type mockServer struct {
 	t       *testing.T
 	files   map[string]*mockFile
 	next    int
+	tick    int
+	gone    []map[string]any // tombstones
 	mutated []string
 	uploads map[string]string
 }
@@ -45,12 +48,43 @@ func newMock(t *testing.T) *mockServer {
 	return m
 }
 
+// bump records a change the way the server does, by moving the row to a new tick.
+func (m *mockServer) bump(id string) {
+	m.tick++
+	m.files[id].vf["Tick"] = m.tick
+}
+
 func (m *mockServer) add(id, parent, name string, attrs int, content []byte) {
 	m.files[id] = &mockFile{content: content, vf: map[string]any{
 		"InternalName": id, "ParrentId": parent, "PublicName": name, "ShareId": testShare,
 		"Attributes": attrs, "IsFile": attrs != 16, "EndOfFile": len(content), "Tick": 1, "ShareTick": 1,
 		"LastWriteTime": "2024-05-01T10:00:00", "FilehHash": "h1", "Deleted": false, "UploadName": "v-" + id,
 	}}
+	m.bump(id)
+}
+
+func (m *mockServer) catchup(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if q.Get("token") != "acl-"+testShare {
+		http.Error(w, "bad acl token", 403)
+		return
+	}
+	from, _ := strconv.Atoi(q.Get("tickFrom"))
+	take, _ := strconv.Atoi(q.Get("tickTake"))
+	rows := []map[string]any{}
+	all := m.gone
+	for _, f := range m.files {
+		all = append(all, f.vf)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i]["Tick"].(int) < all[j]["Tick"].(int) })
+	largest := 0
+	for _, vf := range all {
+		if vf["Tick"].(int) > from && len(rows) < take {
+			rows = append(rows, vf)
+			largest = vf["Tick"].(int)
+		}
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"RfVirtualFiles": rows, "ShareTick": m.tick, "LargestTick": largest})
 }
 
 func (m *mockServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,6 +99,12 @@ func (m *mockServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case regexp.MustCompile(`^/api/users/[^/]+/shares$`).MatchString(path):
 		write(map[string]any{"Data": []map[string]any{{"Id": testShare, "Name": "Company", "ShareType": 0}}})
+	case path == "/api/client/fullprofile":
+		write(map[string]any{"Data": map[string]any{"ManagedShares": []map[string]any{
+			{"ShareId": testShare, "ShareAcl": map[string]any{"AclToken": "acl-" + testShare}},
+		}}})
+	case path == "/api/client/catchup":
+		m.catchup(w, r)
 	case strings.HasSuffix(path, "/children"):
 		parent := strings.Split(path, "/")[5]
 		out := []map[string]any{}
@@ -109,6 +149,7 @@ func (m *mockServer) chunk(w http.ResponseWriter, r *http.Request) {
 	f.vf["EndOfFile"] = len(f.content)
 	f.vf["FilehHash"] = fmt.Sprintf("h%d", time.Now().UnixNano())
 	f.vf["UploadName"] = fmt.Sprintf("v%d", time.Now().UnixNano())
+	m.bump(id)
 	_ = json.NewEncoder(w).Encode(map[string]any{"Data": map[string]any{"ClientJournalEvent": map[string]any{"RfVirtualFile": f.vf}}})
 }
 
@@ -156,18 +197,29 @@ func (m *mockServer) files_(w http.ResponseWriter, r *http.Request) {
 			resp["Url"] = "/upload/" + id
 		} else {
 			m.files[id].content, m.files[id].vf["EndOfFile"] = nil, 0
+			m.bump(id)
 		}
 		resp["ClientJournalEvent"] = map[string]any{"RfVirtualFile": m.files[id].vf}
 	case r.Method == http.MethodPut && event == eventRename:
-		m.files[id].vf["PublicName"], m.files[id].vf["Tick"] = vf["PublicName"], 2
+		m.files[id].vf["PublicName"] = vf["PublicName"]
+		m.bump(id)
 	case r.Method == http.MethodPut && event == eventMove:
 		m.files[id].vf["ParrentId"] = vf["ParrentId"]
+		m.bump(id)
 	case r.Method == http.MethodDelete && event == eventDelete:
-		delete(m.files, id)
+		m.tombstone(id)
 	default:
 		m.t.Errorf("wrong verb for event: %s %d", r.Method, event)
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"Data": resp, "Code": 1})
+}
+
+func (m *mockServer) tombstone(id string) {
+	row := m.files[id].vf
+	delete(m.files, id)
+	m.tick++
+	row["Deleted"], row["Tick"] = true, m.tick
+	m.gone = append(m.gone, row)
 }
 
 func (m *mockServer) events() string {
@@ -205,7 +257,12 @@ func startMount(t *testing.T, srv *httptest.Server, args ...string) string {
 	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	base := t.TempDir()
+	return mountAt(t, srv, bin, t.TempDir(), args...)
+}
+
+// mountAt mounts with the state in base, so a test can restart on the same cache.
+func mountAt(t *testing.T, srv *httptest.Server, bin, base string, args ...string) string {
+	t.Helper()
 	mnt := filepath.Join(base, "mnt")
 	_ = os.Mkdir(mnt, 0o755)
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user1","primary_domain":"example.test"}`))
@@ -408,5 +465,332 @@ func TestConflictKeepsBothVersions(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(dir, "readme.txt"))
 	if err != nil || string(got) != "someone else\n" {
 		t.Fatalf("cache served the wrong version: %q %v", got, err)
+	}
+}
+
+// mountStoppable mounts and returns a function that unmounts and waits for exit.
+func mountStoppable(t *testing.T, srv *httptest.Server, bin, base string) (string, func()) {
+	t.Helper()
+	mnt := filepath.Join(base, "mnt")
+	_ = os.MkdirAll(mnt, 0o755)
+	cfg := filepath.Join(base, "config", "rushfiles-linux")
+	_ = os.MkdirAll(cfg, 0o700)
+	if !exists(filepath.Join(cfg, "tokens.json")) {
+		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user1","primary_domain":"example.test"}`))
+		tok, _ := json.Marshal(tokenSet{AccessToken: "x." + payload + ".y", RefreshToken: "r", Expiry: time.Now().Add(time.Hour), DeviceID: "dev1"})
+		_ = os.WriteFile(filepath.Join(cfg, "tokens.json"), tok, 0o600)
+	}
+	cmd := exec.Command(bin, "mount", "--sync-interval", "50ms", mnt)
+	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(base, "config"), "XDG_CACHE_HOME="+filepath.Join(base, "cache"),
+		"RUSHFILES_GATEWAY_URL="+srv.URL, "RUSHFILES_FILECACHE_URL="+srv.URL)
+	var logs bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &logs, &logs
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	stop := func() {
+		if !stopped {
+			stopped = true
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			_ = cmd.Wait()
+			t.Log(logs.String())
+		}
+	}
+	t.Cleanup(stop)
+	waitFor(t, "mount", func() bool { return exists(filepath.Join(mnt, "Company")) })
+	return filepath.Join(mnt, "Company"), stop
+}
+
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	for i := 0; i < 200; i++ {
+		if ok() {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func TestTreeFollowsRemoteChanges(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--sync-interval", "50ms", "--list-ttl", "1h")
+
+	remote := func(change func()) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		change()
+	}
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(dir, "Docs", "nested.txt")) })
+
+	remote(func() { m.add("r1", "d1", "added.txt", 128, []byte("added")) })
+	// Entries the kernel has not cached show up as soon as the tree has them.
+	waitFor(t, "remote add", func() bool { return exists(filepath.Join(dir, "Docs", "added.txt")) })
+	if got, err := os.ReadFile(filepath.Join(dir, "Docs", "added.txt")); err != nil || string(got) != "added" {
+		t.Fatalf("read remote add: %q %v", got, err)
+	}
+
+	remote(func() {
+		m.files["r1"].content = []byte("changed!")
+		m.files["r1"].vf["EndOfFile"], m.files["r1"].vf["UploadName"] = 8, "v-r1-2"
+		m.bump("r1")
+	})
+	waitFor(t, "remote edit", func() bool {
+		got, _ := os.ReadFile(filepath.Join(dir, "Docs", "added.txt"))
+		return string(got) == "changed!"
+	})
+
+	remote(func() {
+		m.files["f2"].vf["PublicName"] = "renamed.txt"
+		m.bump("f2")
+		m.tombstone("r1")
+	})
+	waitFor(t, "remote rename and delete", func() bool {
+		names := []string{}
+		entries, _ := os.ReadDir(filepath.Join(dir, "Docs"))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return strings.Join(names, ",") == "renamed.txt"
+	})
+}
+
+func TestPermanentDeleteIsReconciled(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--sync-interval", "50ms")
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(dir, "Docs", "nested.txt")) })
+	time.Sleep(200 * time.Millisecond)
+
+	// No tombstone: the row just vanishes and the tick moves, leaving a gap.
+	m.mu.Lock()
+	delete(m.files, "f2")
+	m.tick += 5
+	m.mu.Unlock()
+	waitFor(t, "permanent delete", func() bool {
+		entries, _ := os.ReadDir(filepath.Join(dir, "Docs"))
+		return len(entries) == 0
+	})
+	if got := m.names(); !strings.Contains(got, "readme.txt") {
+		t.Fatalf("mock lost data: %s", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Fatalf("reconcile dropped live rows: %v", entries)
+	}
+}
+
+func TestOfflineAfterRestart(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	bin := filepath.Join(t.TempDir(), "rushfiles")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	base := t.TempDir()
+	first, stop := mountStoppable(t, srv, bin, base)
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(first, "Docs", "nested.txt")) })
+	if got, err := os.ReadFile(filepath.Join(first, "readme.txt")); err != nil || len(got) == 0 {
+		t.Fatalf("read: %q %v", got, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	srv.Close()
+
+	// The server is gone: mount, browse, and open the file that was cached.
+	dir, stop2 := mountStoppable(t, srv, bin, base)
+	defer stop2()
+	entries, err := os.ReadDir(filepath.Join(dir, "Docs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("offline browse: %v %v", entries, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "readme.txt")); err != nil || string(got) != "hello from the server\n" {
+		t.Fatalf("offline cached read: %q %v", got, err)
+	}
+	if _, err := os.ReadFile(filepath.Join(dir, "Docs", "nested.txt")); err == nil {
+		t.Fatal("an uncached file should fail offline")
+	}
+}
+
+func testTreeDB(t *testing.T) *treeDB {
+	t.Helper()
+	db, err := openTreeDB(filepath.Join(t.TempDir(), "tree.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.db.Close() })
+	return db
+}
+
+func TestFullListingNeverWipesTree(t *testing.T) {
+	share := &Share{ID: "S-1", Name: "s"}
+	tr := newShareTree(testTreeDB(t), share.ID)
+	attrs := fileAttrs(attrNormal)
+	file := func(id, parent, name string) *treeEntry {
+		return entryOf(&VirtualFile{InternalName: id, ParrentID: parent, PublicName: name, Attributes: &attrs})
+	}
+	// Parents and shares are written with and without dashes.
+	tr.finish(share, []*treeEntry{file("a", "s1", "one"), file("b", "S-1", "two"), file("s-1", "s1", "self")}, 5, true)
+	if got := tr.children("S-1"); len(got) != 2 {
+		t.Fatalf("children: %v", got)
+	}
+	tr.finish(share, nil, 6, true)
+	if got := tr.children("s1"); len(got) != 2 {
+		t.Fatalf("empty listing wiped the tree: %v", got)
+	}
+
+	// A change made during a catch-up beats the older rows.
+	tr.begin()
+	tr.put(VirtualFile{InternalName: "a", ParrentID: "s1", PublicName: "renamed", Attributes: &attrs})
+	tr.finish(share, []*treeEntry{file("a", "s1", "one")}, 7, true)
+	if tr.child("s1", "renamed") == nil {
+		t.Fatal("local rename lost")
+	}
+	if tr.child("s1", "two") != nil {
+		t.Fatal("full listing kept a row it no longer has")
+	}
+}
+
+func TestTreeSurvivesReopen(t *testing.T) {
+	share := &Share{ID: "s1", Name: "s"}
+	path := filepath.Join(t.TempDir(), "tree.db")
+	db, err := openTreeDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := fileAttrs(attrNormal)
+	created := time.Date(2023, 2, 3, 4, 5, 6, 0, time.UTC)
+	newShareTree(db, share.ID).finish(share, []*treeEntry{entryOf(&VirtualFile{
+		InternalName: "a", ParrentID: "s1", PublicName: "one", User: "someone", Attributes: &attrs,
+		CreationTime: &netTime{created},
+	})}, 5, true)
+	db.db.Close()
+
+	if db, err = openTreeDB(path); err != nil {
+		t.Fatal(err)
+	}
+	defer db.db.Close()
+	trees, err := db.loadTrees()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := trees[share.ID]
+	if tr == nil || !tr.isReady() || tr.begin() != 5 {
+		t.Fatalf("share state lost: %+v", tr)
+	}
+	vf, ok := tr.get("a")
+	if !ok || vf.User != "someone" || vf.CreationTime == nil || !vf.CreationTime.Equal(created) {
+		t.Fatalf("lost across reopen: %+v", vf)
+	}
+	var writeAhead int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&writeAhead); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{path, path + "-wal", path + "-shm"} {
+		if st, err := os.Stat(name); err == nil && st.Mode().Perm() != 0o600 {
+			t.Fatalf("%s is not private: %v", name, st.Mode())
+		} else if err != nil && name == path {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestOldTreeVersionIsRebuilt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tree.db")
+	db, err := openTreeDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec("PRAGMA user_version = 1; INSERT INTO shares VALUES ('old', 9, 0)"); err != nil {
+		t.Fatal(err)
+	}
+	db.db.Close()
+	if db, err = openTreeDB(path); err != nil {
+		t.Fatal(err)
+	}
+	defer db.db.Close()
+	if trees, err := db.loadTrees(); err != nil || len(trees) != 0 {
+		t.Fatalf("old tree kept: %v %v", trees, err)
+	}
+}
+
+func TestTrimLeavesOpenFilesAlone(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "50ms", "--trim-interval", "50ms")
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(dir, "Docs", "nested.txt")) })
+
+	// A file held open for reading and one mid-edit, with trims running throughout.
+	reader, err := os.Open(filepath.Join(dir, "Docs", "nested.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	editor, err := os.OpenFile(filepath.Join(dir, "readme.txt"), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := editor.WriteString("one\n"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if _, err := editor.WriteString("two\n"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	got, err := io.ReadAll(reader)
+	if err != nil || string(got) != "nested\n" {
+		t.Fatalf("read across trims: %q %v", got, err)
+	}
+	if err := editor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(m.content("readme.txt")); got != "hello from the server\none\ntwo\n" {
+		t.Fatalf("edit across trims: %q", got)
+	}
+
+	// Paths still resolve after their entries were dropped, also from inside a folder.
+	sub := exec.Command("sh", "-c", "cd Docs && sleep 0.5 && cat nested.txt && pwd >/dev/null")
+	sub.Dir = dir
+	if out, err := sub.CombinedOutput(); err != nil || string(out) != "nested\n" {
+		t.Fatalf("cwd across trims: %q %v", out, err)
+	}
+	for i := 0; i < 20; i++ {
+		if got, err := os.ReadFile(filepath.Join(dir, "readme.txt")); err != nil || !strings.HasSuffix(string(got), "two\n") {
+			t.Fatalf("read after trims: %q %v", got, err)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func TestIdlePollDoesNotWrite(t *testing.T) {
+	share := &Share{ID: "s1", Name: "s"}
+	db := testTreeDB(t)
+	tr := newShareTree(db, share.ID)
+	attrs := fileAttrs(attrNormal)
+	tr.finish(share, []*treeEntry{entryOf(&VirtualFile{InternalName: "a", ParrentID: "s1", PublicName: "one", Attributes: &attrs})}, 5, true)
+	before := tr.reconciledAt
+	var changes int
+	read := func() int {
+		var n int
+		if err := db.db.QueryRow("SELECT total_changes()").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	changes = read()
+	tr.begin()
+	tr.finish(share, nil, 5, false)
+	if read() != changes || tr.reconciledAt != before {
+		t.Fatal("an idle poll wrote to the database")
 	}
 }

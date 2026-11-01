@@ -26,6 +26,7 @@ type driveOptions struct {
 	listTTL   time.Duration
 	cacheDir  string
 	cacheSize int64
+	sync      *treeSync // nil with --no-sync
 }
 
 // node is the mount root (share == nil), a share root, a folder or a file.
@@ -103,10 +104,39 @@ func (n *node) parentIDLocked() string {
 	return ""
 }
 
-// list refreshes the cached listing. Remote changes appear once listTTL lapses.
+// tree returns this share's local tree when it is ready to be used.
+func (n *node) tree() *shareTree {
+	if n.opts.sync == nil || n.share == nil {
+		return nil
+	}
+	return n.opts.sync.tree(n.share.ID)
+}
+
+// changed records a local change in the tree and asks for a catch-up.
+func (n *node) changed(update func(t *shareTree)) {
+	if t := n.tree(); t != nil {
+		update(t)
+		n.opts.sync.wake(n.share.ID)
+	}
+}
+
+// list loads the live listing, used until the first catch-up is done and with
+// --no-sync. Remote changes then appear once listTTL lapses. With a tree, folders
+// keep no listing of their own, since that would be a second copy of the tree.
 func (n *node) list(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if n.opts.sync != nil {
+		if n.share == nil {
+			if shares := n.opts.sync.sharesSnapshot(); len(shares) > 0 {
+				n.setShares(shares)
+				return nil
+			}
+		} else if n.tree() != nil {
+			n.children = nil
+			return nil
+		}
+	}
 	if !n.listedAt.IsZero() && time.Since(n.listedAt) < n.opts.listTTL {
 		return nil
 	}
@@ -132,6 +162,11 @@ func (n *node) listShares(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	n.setShares(shares)
+	return nil
+}
+
+func (n *node) setShares(shares []*Share) {
 	sort.Slice(shares, func(i, j int) bool { return shares[i].ID < shares[j].ID })
 	n.shares = make(map[string]*Share, len(shares))
 	for _, s := range shares {
@@ -142,7 +177,25 @@ func (n *node) listShares(ctx context.Context) error {
 		n.shares[name] = s
 	}
 	n.listedAt = time.Now()
-	return nil
+}
+
+// trim asks the kernel to drop entries of this subtree, so that anything scanning
+// the drive does not pin a node per path. It only drops what nothing is using, and
+// the next access looks the entry up again. Nodes being edited stay. It returns how
+// many entries it dropped, deepest first, as a folder can't go before its contents.
+func (n *node) trim() int {
+	dropped := 0
+	for name, child := range n.Children() {
+		c := child.Operations().(*node)
+		dropped += c.trim()
+		c.mu.Lock()
+		editing := c.work != nil
+		c.mu.Unlock()
+		if !editing && n.NotifyEntry(name) == 0 {
+			dropped++
+		}
+	}
+	return dropped
 }
 
 func (n *node) invalidate() {
@@ -218,33 +271,54 @@ func (n *node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs
 	}
 	n.mu.Lock()
 	share, isShare := n.shares[name]
-	vf, isChild := n.children[name]
 	n.mu.Unlock()
-	switch {
-	case isShare:
+	if isShare {
 		return n.childNode(ctx, name, share, VirtualFile{}, out), 0
-	case isChild:
+	}
+	if vf, ok := n.child(name); ok {
 		return n.childNode(ctx, name, n.share, vf, out), 0
 	}
 	return nil, syscall.ENOENT
+}
+
+// child finds an entry after list, in the tree or else in the live listing.
+func (n *node) child(name string) (VirtualFile, bool) {
+	if t := n.tree(); t != nil {
+		if e := t.child(n.parentID(), name); e != nil {
+			return e.record(), true
+		}
+		return VirtualFile{}, false
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	vf, ok := n.children[name]
+	return vf, ok
 }
 
 func (n *node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	if err := n.list(ctx); err != nil {
 		return nil, toErrno(err)
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	entries := make([]fuse.DirEntry, 0, len(n.children)+len(n.shares))
-	for name, s := range n.shares {
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: syscall.S_IFDIR, Ino: inoFor("share:" + s.ID)})
-	}
-	for name, vf := range n.children {
+	var entries []fuse.DirEntry
+	add := func(name, id string, dir bool) {
 		mode := uint32(syscall.S_IFREG)
-		if vf.isDir() {
+		if dir {
 			mode = syscall.S_IFDIR
 		}
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: mode, Ino: inoFor(vf.InternalName)})
+		entries = append(entries, fuse.DirEntry{Name: name, Mode: mode, Ino: inoFor(id)})
+	}
+	if t := n.tree(); t != nil {
+		for _, e := range t.children(n.parentID()) {
+			add(e.Name, e.ID, e.Dir)
+		}
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for name, s := range n.shares {
+		add(name, "share:"+s.ID, true)
+	}
+	for name, vf := range n.children {
+		add(name, vf.InternalName, vf.isDir())
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	return fs.NewListDirStream(entries), 0
@@ -365,6 +439,16 @@ const (
 )
 
 func (n *node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	// The kernel may still hold an older entry than the tree does.
+	if t := n.tree(); t != nil {
+		if vf, ok := t.get(n.vf.InternalName); ok {
+			n.mu.Lock()
+			if n.work == nil {
+				n.vf = vf
+			}
+			n.mu.Unlock()
+		}
+	}
 	if flags&writeFlags == 0 {
 		// A scrapped work file lingers until the async release; it isn't the file's content.
 		n.mu.Lock()
@@ -446,6 +530,7 @@ func (n *node) flush() error {
 				n.mu.Lock()
 				n.vf, n.base, n.scrapWork = *remote, remote.version(), true
 				n.mu.Unlock()
+				n.changed(func(t *shareTree) { t.put(*remote) })
 				return nil
 			}
 		} else if err == nil {
@@ -479,7 +564,6 @@ func (n *node) afterUpload(uploaded *VirtualFile, size int64, mtime time.Time) {
 	n.mu.Unlock()
 	remote, err := n.c.virtualFile(context.Background(), n.share, id)
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	n.vf.EndOfFile, n.vf.LastWriteTime = &size, &netTime{mtime}
 	if uploaded != nil {
 		n.vf.Tick, n.vf.FilehHash, n.vf.UploadName = uploaded.Tick, uploaded.FilehHash, uploaded.UploadName
@@ -491,6 +575,9 @@ func (n *node) afterUpload(uploaded *VirtualFile, size int64, mtime time.Time) {
 		n.vf.Tick, n.vf.FilehHash, n.vf.UploadName, n.vf.EndOfFile, n.vf.LastWriteTime = remote.Tick, remote.FilehHash, remote.UploadName, remote.EndOfFile, remote.LastWriteTime
 	}
 	n.base = n.vf.version()
+	vf := n.vf
+	n.mu.Unlock()
+	n.changed(func(t *shareTree) { t.put(vf) })
 }
 
 // release drops the work file with the last handle. Edits that failed to upload
@@ -633,6 +720,10 @@ func (n *node) writable() syscall.Errno {
 }
 
 func (n *node) add(name string, vf *VirtualFile) {
+	if n.tree() != nil {
+		n.changed(func(t *shareTree) { t.put(*vf) })
+		return
+	}
 	n.mu.Lock()
 	if n.children == nil {
 		n.children = map[string]VirtualFile{}
@@ -683,18 +774,35 @@ func (n *node) find(ctx context.Context, name string) (VirtualFile, syscall.Errn
 	if err := n.list(ctx); err != nil {
 		return VirtualFile{}, toErrno(err)
 	}
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	vf, ok := n.children[name]
+	vf, ok := n.child(name)
 	if !ok {
 		return vf, syscall.ENOENT
 	}
 	return vf, 0
 }
 
+// fullRecord returns the complete server record. Tree entries are trimmed, and
+// changes must echo the whole record the way the Windows client does.
+func (n *node) fullRecord(ctx context.Context, vf VirtualFile) (VirtualFile, syscall.Errno) {
+	if n.tree() == nil {
+		return vf, 0
+	}
+	full, err := n.c.virtualFile(ctx, n.share, vf.InternalName)
+	if err != nil {
+		return vf, toErrno(err)
+	}
+	if full == nil {
+		return vf, syscall.ENOENT
+	}
+	return *full, 0
+}
+
 func (n *node) drop(ctx context.Context, name string) syscall.Errno {
 	vf, errno := n.find(ctx, name)
 	if errno != 0 {
+		return errno
+	}
+	if vf, errno = n.fullRecord(ctx, vf); errno != 0 {
 		return errno
 	}
 	if err := n.c.remove(ctx, n.share, vf); err != nil {
@@ -703,6 +811,7 @@ func (n *node) drop(ctx context.Context, name string) syscall.Errno {
 	n.mu.Lock()
 	delete(n.children, name)
 	n.mu.Unlock()
+	n.changed(func(t *shareTree) { t.remove(vf.InternalName) })
 	return 0
 }
 
@@ -752,6 +861,9 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	if errno != 0 {
 		return errno
 	}
+	if vf, errno = n.fullRecord(ctx, vf); errno != 0 {
+		return errno
+	}
 	if existing, errno := dst.find(ctx, newName); errno == 0 {
 		if existing.isDir() {
 			return syscall.EISDIR
@@ -772,6 +884,7 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		if err := n.c.rename(ctx, n.share, vf, newName); err != nil {
 			n.invalidate()
 			dst.invalidate()
+			n.changed(func(t *shareTree) { t.put(vf) })
 			return toErrno(err)
 		}
 		vf.PublicName = newName

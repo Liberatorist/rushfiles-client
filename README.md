@@ -49,12 +49,21 @@ To mount at boot instead of at login, also run `loginctl enable-linger $USER`.
 Behaviour worth knowing:
 
 - Files download whole on first open and are cached in `~/.cache/rushfiles-linux/files`.
-- Remote changes appear after `--list-ttl` (15s); there is no SignalR push.
+- The whole file tree is kept in a SQLite database, `~/.cache/rushfiles-linux/tree/tree.db`
+  (table `files`; times are Unix milliseconds), and updated every 30 seconds
+  (`--sync-interval`), so browsing needs no network. The first sync takes about 2 seconds per
+  1,000 files, and folders are listed live until a share's tree is ready. `--no-sync` turns this off.
+- Offline, the tree stays browsable and cached files open. Other files, and edits, need the
+  server. Changes arrive by polling, so there is no instant push from other users.
+- The tree holds names, sizes, dates and lock state for every share. `rushfiles logout`
+  removes it.
+- Every 5 minutes (`--trim-interval`) the mount drops memory held for paths nothing is using,
+  so a tool scanning the drive doesn't leave it large. The next access looks them up again.
 - Edits upload on close. If the upload fails, the mount logs where the edit was kept
   (`~/.cache/rushfiles-linux/files/work`).
 - If the server copy changed during an edit, the edit is saved as a
   `name (linux conflict DATE).ext` sibling.
-- There is no offline mode, pinning, or public-link/lock UI.
+- There is no offline editing, pinning, or public-link/lock UI.
 
 Login tokens are stored in `~/.config/rushfiles-linux/tokens.json` (mode 0600).
 `go test .` runs the end-to-end tests: a real FUSE mount against a mock server.

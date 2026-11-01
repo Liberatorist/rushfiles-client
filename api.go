@@ -31,6 +31,7 @@ const (
 
 	shareTypeSubShare = 1
 	uploadChunkSize   = 10 * 1024 * 1024
+	catchupBatch      = 10000
 )
 
 // netTime reads the timestamp styles .NET emits and writes UTC.
@@ -254,8 +255,13 @@ func newAPIClient(readOnly bool) (*apiClient, error) {
 	}
 	src := &tokenSource{t: t}
 	token, err := src.get(context.Background(), "")
-	if err != nil {
+	if errors.Is(err, errLoginRejected) {
 		return nil, fmt.Errorf("refreshing the login failed, run `rushfiles login`: %w", err)
+	}
+	if err != nil {
+		// Probably offline. The old token still says who we are, and refreshing can wait.
+		log.Printf("could not refresh the login: %v", err)
+		token = t.AccessToken
 	}
 	c, err := parseClaims(token)
 	if err != nil {
@@ -332,7 +338,17 @@ func (c *apiClient) getJSON(ctx context.Context, target string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// shares lists what it can reach, failing only when no domain answered.
 func (c *apiClient) shares(ctx context.Context) ([]*Share, error) {
+	all, err := c.allShares(ctx)
+	if len(all) > 0 {
+		return all, nil
+	}
+	return nil, err
+}
+
+// allShares also returns the first error when some domains could not be listed.
+func (c *apiClient) allShares(ctx context.Context) ([]*Share, error) {
 	var all []*Share
 	seen := map[string]bool{}
 	var firstErr error
@@ -356,10 +372,49 @@ func (c *apiClient) shares(ctx context.Context) ([]*Share, error) {
 			}
 		}
 	}
-	if len(all) == 0 {
-		return nil, firstErr
+	return all, firstErr
+}
+
+type catchupPage struct {
+	RfVirtualFiles []VirtualFile
+	ShareTick      int64
+	LargestTick    int64
+	FullCatchup    bool
+}
+
+func (c *apiClient) catchup(ctx context.Context, s *Share, token string, tickFrom, tickStart int64) (*catchupPage, error) {
+	q := url.Values{
+		"token": {token}, "shareId": {s.ID}, "tickFrom": {fmt.Sprint(tickFrom)},
+		"tickTake": {fmt.Sprint(catchupBatch)}, "tickStart": {fmt.Sprint(tickStart)},
 	}
-	return all, nil
+	var out catchupPage
+	if err := c.getJSON(ctx, gatewayURL(s.Domain)+"/api/client/catchup?"+q.Encode(), &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// shareTokens returns the per-share tokens catch-up needs, keyed by share id.
+func (c *apiClient) shareTokens(ctx context.Context, domain string) (map[string]string, error) {
+	var out struct {
+		Data struct {
+			ManagedShares []struct {
+				ShareID  string `json:"ShareId"`
+				ShareACL struct {
+					ACLToken string `json:"AclToken"`
+				} `json:"ShareAcl"`
+			}
+		}
+	}
+	target := gatewayURL(domain) + "/api/client/fullprofile?tick=1&api=1&associationRequired=false"
+	if err := c.getJSON(ctx, target, &out); err != nil {
+		return nil, err
+	}
+	tokens := make(map[string]string, len(out.Data.ManagedShares))
+	for _, m := range out.Data.ManagedShares {
+		tokens[m.ShareID] = m.ShareACL.ACLToken
+	}
+	return tokens, nil
 }
 
 func (c *apiClient) children(ctx context.Context, s *Share, parentID string) ([]VirtualFile, error) {
