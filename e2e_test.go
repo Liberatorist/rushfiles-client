@@ -116,8 +116,16 @@ func (m *mockServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		write(map[string]any{"Data": out})
 	case strings.Contains(path, "/virtualFiles/"):
-		f := m.files[path[strings.LastIndex(path, "/")+1:]]
+		id := path[strings.LastIndex(path, "/")+1:]
+		f := m.files[id]
 		if f == nil {
+			// The live server keeps answering for deleted files.
+			for _, row := range m.gone {
+				if row["InternalName"] == id {
+					write(map[string]any{"Data": row})
+					return
+				}
+			}
 			http.NotFound(w, r)
 			return
 		}
@@ -863,5 +871,28 @@ func TestLocksBindOtherUsersOnly(t *testing.T) {
 	m.mu.Unlock() // no tick: the tree doesn't know yet
 	if err := os.Remove(spare); !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("delete of a freshly locked file: %v", err)
+	}
+}
+
+func TestEditOfRemotelyDeletedFileDoesNotRevive(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "1h")
+	readme := filepath.Join(dir, "readme.txt")
+	f, err := os.OpenFile(readme, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.tombstone("f1")
+	m.mu.Unlock()
+	m.events()
+	_, _ = f.WriteString("late edit\n")
+	if err := f.Close(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("closing an edit of a deleted file: %v", err)
+	}
+	if ev := m.events(); ev != "" {
+		t.Fatalf("edit of a deleted file reached the server: %s", ev)
 	}
 }

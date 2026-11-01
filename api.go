@@ -438,6 +438,10 @@ func (c *apiClient) virtualFile(ctx context.Context, s *Share, id string) (*Virt
 	if err := c.getJSON(ctx, target, &out); err != nil {
 		return nil, err
 	}
+	// Deleted files stay readable here, with Deleted set, instead of giving a 404.
+	if out.Data != nil && out.Data.Deleted {
+		return nil, syscall.ENOENT
+	}
 	return out.Data, nil
 }
 
