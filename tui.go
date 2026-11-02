@@ -447,10 +447,6 @@ func (m *model) viewMenu(b *strings.Builder) {
 			b.WriteString("  " + m.itemLabel(item) + "\n")
 		}
 	}
-	if m.rw {
-		b.WriteString("\n" + warnStyle.Render("Read-write has not been verified against the live server yet. Try it on a throwaway file first."))
-		b.WriteString("\n")
-	}
 	if m.busy {
 		b.WriteString("\n" + hintStyle.Render("Working..."))
 	} else {
