@@ -75,6 +75,13 @@ Behaviour worth knowing:
   retried a few times; if it still fails, the mount logs where the edit was kept
   (`~/.cache/rushfiles-linux/files/work`). `--upload-delay 0` uploads during close
   instead, which is slower but lets the editor see an upload error.
+- Deletes go out in the background after the same delay, so `rm -r` returns right away. When
+  a folder and everything in it are deleted, the server gets one delete of the folder. Before
+  it is sent, the mount checks that nobody added to the folder meanwhile; if they did, only
+  what was deleted here goes, and the folder comes back. A file someone else locked in the
+  meantime comes back too, and the log says why. Creating a file with the name of one still
+  being deleted sends that delete first. Unmounting sends what is queued. With
+  `--upload-delay 0` or `--no-sync`, deletes wait for the server as before.
 - If the server copy changed during an edit, the edit is saved as a
   `name (linux conflict DATE).ext` sibling.
 - There is no offline editing, pinning, or public-link/lock UI.

@@ -216,12 +216,14 @@ type shareTree struct {
 	// Local changes made during a catch-up win over its rows, which may predate them.
 	syncing bool
 	touched map[string]bool
+	// Entries whose delete is queued. Catch-up would bring them back until it is sent.
+	hidden map[string]bool
 
 	reconciledAt time.Time
 }
 
 func newShareTree(db *treeDB, share string) *shareTree {
-	return &shareTree{db: db, share: share, touched: map[string]bool{}}
+	return &shareTree{db: db, share: share, touched: map[string]bool{}, hidden: map[string]bool{}}
 }
 
 // loadTrees returns the trees of all shares the database knows.
@@ -320,6 +322,30 @@ func (t *shareTree) remove(id string) {
 	t.noteLocal(id)
 }
 
+// hide removes an entry whose delete is queued, and keeps it out until unhide.
+func (t *shareTree) hide(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, err := t.db.drop.Exec(t.share, normID(id)); err != nil {
+		log.Printf("tree: saving a delete: %v", err)
+	}
+	t.hidden[normID(id)] = true
+	t.noteLocal(id)
+}
+
+// unhide ends a queued delete. A refused one passes its entry back.
+func (t *shareTree) unhide(id string, restore *VirtualFile) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.hidden, normID(id))
+	if restore != nil {
+		if err := t.db.put(t.db.upsert, t.share, entryOf(restore)); err != nil {
+			log.Printf("tree: saving a change: %v", err)
+		}
+	}
+	t.noteLocal(id)
+}
+
 func (t *shareTree) noteLocal(id string) {
 	if t.syncing {
 		t.touched[normID(id)] = true
@@ -412,7 +438,7 @@ func (t *shareTree) commit(s *Share, rows []*treeEntry, tick int64, full bool) e
 	root := normID(s.rootParentID())
 	for _, e := range rows {
 		key := normID(e.ID)
-		if key == "" || key == root || key == normID(e.Parent) || t.touched[key] {
+		if key == "" || key == root || key == normID(e.Parent) || t.touched[key] || t.hidden[key] {
 			continue
 		}
 		if e.Deleted {

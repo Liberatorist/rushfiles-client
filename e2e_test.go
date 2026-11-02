@@ -223,7 +223,13 @@ func (m *mockServer) files_(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"Data": resp, "Code": 1})
 }
 
+// tombstone deletes a file, or a folder with everything in it.
 func (m *mockServer) tombstone(id string) {
+	for kid, f := range m.files {
+		if f.vf["ParrentId"] == id {
+			m.tombstone(kid)
+		}
+	}
 	row := m.files[id].vf
 	delete(m.files, id)
 	m.tick++
@@ -429,9 +435,9 @@ func TestReadWriteMount(t *testing.T) {
 	if err := os.Remove(sub); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(m.names(), "New Folder") || strings.Contains(m.names(), "moved.txt") {
-		t.Errorf("deletes did not reach the server: %s", m.names())
-	}
+	waitFor(t, "deletes", func() bool {
+		return !strings.Contains(m.names(), "New Folder") && !strings.Contains(m.names(), "moved.txt")
+	})
 }
 
 func TestConflictKeepsBothVersions(t *testing.T) {
@@ -862,12 +868,18 @@ func TestLocksBindOtherUsersOnly(t *testing.T) {
 		t.Fatalf("rename under own lock: %v", err)
 	}
 
-	// A lock taken after the last sync is caught by the fresh server record.
+	// A lock taken after the last sync is caught by the fresh server record before
+	// the queued delete goes out, and the file comes back.
 	m.mu.Lock()
 	m.files["spare"].vf["FileLock"] = map[string]any{"IsLocked": true, "LockedBy": "someone-else"}
 	m.mu.Unlock() // no tick: the tree doesn't know yet
-	if err := os.Remove(spare); !errors.Is(err, os.ErrPermission) {
-		t.Fatalf("delete of a freshly locked file: %v", err)
+	m.events()
+	if err := os.Remove(spare); err != nil {
+		t.Fatalf("queued delete: %v", err)
+	}
+	waitFor(t, "refused delete to come back", func() bool { return exists(spare) })
+	if ev := m.events(); strings.Contains(ev, "DELETE") {
+		t.Errorf("delete of a freshly locked file reached the server: %s", ev)
 	}
 }
 
@@ -957,5 +969,105 @@ func TestUnmountFinishesUploads(t *testing.T) {
 	stop()
 	if got := string(m.content("late.txt")); got != "late\n" {
 		t.Fatalf("edit lost on unmount: %q", got)
+	}
+}
+
+func TestFolderDeleteIsCombined(t *testing.T) {
+	m := newMock(t)
+	m.add("d2", "d1", "Sub", 16, nil)
+	m.add("f3", "d2", "deep.txt", 128, []byte("deep\n"))
+	m.add("f4", "d1", "other.txt", 128, []byte("other\n"))
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "50ms", "--upload-delay", "500ms")
+	docs := filepath.Join(dir, "Docs")
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(docs, "Sub", "deep.txt")) })
+	m.events()
+
+	if err := os.RemoveAll(docs); err != nil {
+		t.Fatal(err)
+	}
+	if ev := m.events(); ev != "" {
+		t.Fatalf("rm -r waited for the server: %s", ev)
+	}
+	// Catch-ups before the delete goes out must not bring the folder back.
+	for i := 0; i < 8; i++ {
+		if exists(docs) {
+			t.Fatal("queued folder came back before its delete")
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+	waitFor(t, "folder delete", func() bool { return !strings.Contains(m.names(), "Docs") })
+	if ev := m.events(); ev != "DELETE:1:Docs" {
+		t.Errorf("deletes were not combined: %s", ev)
+	}
+	if got := m.names(); got != "readme.txt" {
+		t.Errorf("server kept: %s", got)
+	}
+}
+
+func TestRemoteAddKeepsQueuedFolder(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "50ms", "--upload-delay", "500ms")
+	docs := filepath.Join(dir, "Docs")
+	waitFor(t, "initial tree", func() bool { return exists(filepath.Join(docs, "nested.txt")) })
+	m.events()
+
+	if err := os.RemoveAll(docs); err != nil {
+		t.Fatal(err)
+	}
+	// Someone adds a file before the delete goes out: only what was deleted here goes.
+	m.mu.Lock()
+	m.add("late", "d1", "late.txt", 128, []byte("late\n"))
+	m.mu.Unlock()
+	waitFor(t, "folder to come back", func() bool { return exists(filepath.Join(docs, "late.txt")) })
+	if ev := m.events(); ev != "DELETE:1:nested.txt" {
+		t.Errorf("events: %s", ev)
+	}
+	if exists(filepath.Join(docs, "nested.txt")) {
+		t.Error("deleted file came back")
+	}
+}
+
+func TestQueuedDeleteBeforeSameName(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "1h", "--upload-delay", "1s")
+	readme := filepath.Join(dir, "readme.txt")
+	waitFor(t, "initial tree", func() bool { return exists(readme) })
+	time.Sleep(200 * time.Millisecond)
+	m.events()
+
+	if err := os.Remove(readme); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(readme, []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitContent(t, m, "readme.txt", "new\n")
+	if ev := m.events(); ev != "DELETE:1:readme.txt POST:0:readme.txt PUT:3:readme.txt" {
+		t.Errorf("events: %s", ev)
+	}
+}
+
+func TestUnmountFinishesDeletes(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	bin := filepath.Join(t.TempDir(), "rushfiles")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	dir, stop := mountStoppable(t, srv, bin, t.TempDir(), "--rw", "--upload-delay", "10s")
+	time.Sleep(200 * time.Millisecond) // the tree is ready
+	if err := os.Remove(filepath.Join(dir, "readme.txt")); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	if strings.Contains(m.names(), "readme.txt") {
+		t.Fatalf("delete lost on unmount: %s", m.names())
 	}
 }

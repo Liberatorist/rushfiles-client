@@ -30,6 +30,7 @@ type driveOptions struct {
 	// uploadDelay is how long after a save the edit uploads; zero uploads during close.
 	uploadDelay time.Duration
 	uploads     sync.WaitGroup // background uploads not yet finished
+	deletes     *deleteQueue   // nil when deletes go out right away
 }
 
 // node is the mount root (share == nil), a share root, a folder or a file.
@@ -831,6 +832,9 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out 
 	if errno := n.writable(); errno != 0 {
 		return nil, nil, 0, errno
 	}
+	if errno := n.reuse(name); errno != 0 {
+		return nil, nil, 0, errno
+	}
 	vf, _, err := n.c.create(ctx, n.share, n.parentID(), name, attrNormal, 0, time.Now())
 	if err != nil {
 		return nil, nil, 0, toErrno(err)
@@ -853,6 +857,9 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out 
 
 func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	if errno := n.writable(); errno != 0 {
+		return nil, errno
+	}
+	if errno := n.reuse(name); errno != 0 {
 		return nil, errno
 	}
 	vf, _, err := n.c.create(ctx, n.share, n.parentID(), name, attrDirectory, 0, time.Now())
@@ -921,6 +928,9 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 	if errno := n.writable(); errno != 0 {
 		return errno
 	}
+	if n.opts.deletes != nil && n.tree() != nil {
+		return n.queueDrop(ctx, name)
+	}
 	return n.drop(ctx, name)
 }
 
@@ -928,6 +938,9 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if errno := n.writable(); errno != 0 {
 		return errno
+	}
+	if n.opts.deletes != nil && n.tree() != nil {
+		return n.queueDrop(ctx, name)
 	}
 	vf, errno := n.find(ctx, name)
 	if errno != 0 {
@@ -945,6 +958,35 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	return n.drop(ctx, name)
 }
 
+// queueDrop removes an entry from the tree and leaves its delete to the queue. Locks
+// are as of the last sync here; the queue checks the server record before sending.
+func (n *node) queueDrop(ctx context.Context, name string) syscall.Errno {
+	vf, errno := n.find(ctx, name)
+	if errno != 0 {
+		return errno
+	}
+	if vf.lockedByOther(n.c.userID) {
+		return syscall.EACCES
+	}
+	if vf.isDir() && len(n.tree().children(vf.InternalName)) > 0 {
+		return syscall.ENOTEMPTY
+	}
+	if child := n.GetChild(name); child != nil {
+		child.Operations().(*node).discard()
+	}
+	n.opts.deletes.add(n.share, vf)
+	return 0
+}
+
+// reuse sends a queued delete of name first, so the server sees it before a new
+// entry of the same name.
+func (n *node) reuse(name string) syscall.Errno {
+	if n.opts.deletes == nil {
+		return 0
+	}
+	return n.opts.deletes.clearName(n.share, n.parentID(), name)
+}
+
 func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	if errno := n.writable(); errno != 0 {
 		return errno
@@ -958,6 +1000,9 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	}
 	if dst.share.ID != n.share.ID {
 		return syscall.EXDEV
+	}
+	if errno := dst.reuse(newName); errno != 0 {
+		return errno
 	}
 	vf, errno := n.find(ctx, name)
 	if errno != 0 {

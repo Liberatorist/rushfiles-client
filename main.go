@@ -35,7 +35,8 @@ mount options:
   --trim-interval 5m  how often to free memory held for paths nothing is using; 0 turns it off
   --list-ttl 15s      how long live listings are reused, before the tree is ready or with --no-sync
   --cache-gb 10       local download cache limit
-  --upload-delay 1s   how long after a save edits upload; 0 uploads while the file closes
+  --upload-delay 1s   how long after a save edits upload, and after a delete it is sent;
+                      0 sends both while the file closes or is deleted
 
 autostart options:
   --rw                allow changes to be written to the server
@@ -168,6 +169,9 @@ func mount(ctx context.Context, args []string) error {
 		if opts.sync, err = newTreeSync(c, *interval); err != nil {
 			return err
 		}
+		if *uploadDelay > 0 {
+			opts.deletes = newDeleteQueue(c, opts.sync, *uploadDelay)
+		}
 	}
 	mountOpts := []string{"default_permissions"}
 	if !*rw {
@@ -208,6 +212,9 @@ func mount(ctx context.Context, args []string) error {
 	server.Wait()
 	// Saved edits may still be on their way to the server.
 	opts.uploads.Wait()
+	if opts.deletes != nil {
+		opts.deletes.flush()
+	}
 	stopSync()
 	<-synced
 	return nil
