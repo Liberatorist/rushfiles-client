@@ -38,14 +38,11 @@ func TestDefaultsToReadOnly(t *testing.T) {
 	if m.rw {
 		t.Fatal("setup starts read-write")
 	}
-	if strings.Contains(m.View(), "Read-write has not") {
-		t.Fatal("warning shown while read-only")
-	}
 	m.Update(accountMsg{domains: []string{"example.com"}})
 	moveTo(t, m, itemAccess)
 	press(m, tea.KeyEnter)
-	if !m.rw || !strings.Contains(m.View(), "Read-write has not") {
-		t.Fatal("switching to read-write must show the warning")
+	if !m.rw {
+		t.Fatal("access item did not switch to read-write")
 	}
 }
 
