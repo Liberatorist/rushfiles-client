@@ -357,9 +357,7 @@ func TestReadWriteMount(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "big.bin"), big, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(m.content("big.bin"), big) {
-		t.Fatalf("big upload mismatch: %d bytes", len(m.content("big.bin")))
-	}
+	waitFor(t, "big upload", func() bool { return bytes.Equal(m.content("big.bin"), big) })
 	if ev := m.events(); ev != "POST:0:big.bin PUT:3:big.bin" {
 		t.Errorf("create events: %s", ev)
 	}
@@ -369,9 +367,7 @@ func TestReadWriteMount(t *testing.T) {
 	if out, err := sh.CombinedOutput(); err != nil {
 		t.Fatalf("%v %s", err, out)
 	}
-	if got := m.content("readme.txt"); string(got) != "edited\n" {
-		t.Fatalf("overwrite: %q", got)
-	}
+	waitContent(t, m, "readme.txt", "edited\n")
 	time.Sleep(truncateGrace + 200*time.Millisecond)
 	if ev := m.events(); ev != "PUT:3:readme.txt" {
 		t.Errorf("overwrite events: %s", ev)
@@ -389,9 +385,7 @@ func TestReadWriteMount(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(m.content("renamed.txt")); got != "edited\nmore\n" {
-		t.Fatalf("append: %q", got)
-	}
+	waitContent(t, m, "renamed.txt", "edited\nmore\n")
 	if strings.Contains(m.names(), "conflict") {
 		t.Errorf("false conflict after rename: %s", m.names())
 	}
@@ -415,18 +409,19 @@ func TestReadWriteMount(t *testing.T) {
 		t.Errorf("rmdir reached the server: %s", ev)
 	}
 
-	// Editor-style atomic save over an existing file.
+	// Editor-style atomic save over an existing file, renamed before its upload ran.
 	if err := os.WriteFile(filepath.Join(sub, ".tmp"), []byte("saved"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(filepath.Join(sub, ".tmp"), filepath.Join(sub, "moved.txt")); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(m.content("moved.txt")); got != "saved" {
-		t.Fatalf("atomic save: %q", got)
-	}
 	if got, err := os.ReadFile(filepath.Join(sub, "moved.txt")); err != nil || string(got) != "saved" {
-		t.Fatalf("read back: %q %v", got, err)
+		t.Fatalf("read back before upload: %q %v", got, err)
+	}
+	waitContent(t, m, "moved.txt", "saved")
+	if strings.Contains(m.names(), ".tmp") {
+		t.Errorf("upload undid the rename: %s", m.names())
 	}
 	if err := os.Remove(filepath.Join(sub, "moved.txt")); err != nil {
 		t.Fatal(err)
@@ -457,19 +452,18 @@ func TestConflictKeepsBothVersions(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+	waitFor(t, "conflict copy", func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, v := range m.files {
+			if strings.Contains(fmt.Sprint(v.vf["PublicName"]), "conflict") && strings.HasSuffix(string(v.content), "mine\n") {
+				return true
+			}
+		}
+		return false
+	})
 	if got := string(m.content("readme.txt")); got != "someone else\n" {
 		t.Fatalf("server version overwritten: %q", got)
-	}
-	found := false
-	m.mu.Lock()
-	for _, v := range m.files {
-		if strings.Contains(fmt.Sprint(v.vf["PublicName"]), "conflict") {
-			found = strings.HasSuffix(string(v.content), "mine\n")
-		}
-	}
-	m.mu.Unlock()
-	if !found {
-		t.Fatalf("edit was lost: %s", m.names())
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "readme.txt"))
 	if err != nil || string(got) != "someone else\n" {
@@ -478,7 +472,7 @@ func TestConflictKeepsBothVersions(t *testing.T) {
 }
 
 // mountStoppable mounts and returns a function that unmounts and waits for exit.
-func mountStoppable(t *testing.T, srv *httptest.Server, bin, base string) (string, func()) {
+func mountStoppable(t *testing.T, srv *httptest.Server, bin, base string, args ...string) (string, func()) {
 	t.Helper()
 	mnt := filepath.Join(base, "mnt")
 	_ = os.MkdirAll(mnt, 0o755)
@@ -489,7 +483,7 @@ func mountStoppable(t *testing.T, srv *httptest.Server, bin, base string) (strin
 		tok, _ := json.Marshal(tokenSet{AccessToken: "x." + payload + ".y", RefreshToken: "r", Expiry: time.Now().Add(time.Hour), DeviceID: "dev1"})
 		_ = os.WriteFile(filepath.Join(cfg, "tokens.json"), tok, 0o600)
 	}
-	cmd := exec.Command(bin, "mount", "--sync-interval", "50ms", mnt)
+	cmd := exec.Command(bin, append(append([]string{"mount", "--sync-interval", "50ms"}, args...), mnt)...)
 	cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(base, "config"), "XDG_CACHE_HOME="+filepath.Join(base, "cache"),
 		"RUSHFILES_GATEWAY_URL="+srv.URL, "RUSHFILES_FILECACHE_URL="+srv.URL)
 	var logs bytes.Buffer
@@ -509,6 +503,11 @@ func mountStoppable(t *testing.T, srv *httptest.Server, bin, base string) (strin
 	t.Cleanup(stop)
 	waitFor(t, "mount", func() bool { return exists(filepath.Join(mnt, "Company")) })
 	return filepath.Join(mnt, "Company"), stop
+}
+
+func waitContent(t *testing.T, m *mockServer, name, want string) {
+	t.Helper()
+	waitFor(t, name+" upload", func() bool { return string(m.content(name)) == want })
 }
 
 func waitFor(t *testing.T, what string, ok func() bool) {
@@ -763,9 +762,7 @@ func TestTrimLeavesOpenFilesAlone(t *testing.T) {
 	if err := editor.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(m.content("readme.txt")); got != "hello from the server\none\ntwo\n" {
-		t.Fatalf("edit across trims: %q", got)
-	}
+	waitContent(t, m, "readme.txt", "hello from the server\none\ntwo\n")
 
 	// Paths still resolve after their entries were dropped, also from inside a folder.
 	sub := exec.Command("sh", "-c", "cd Docs && sleep 0.5 && cat nested.txt && pwd >/dev/null")
@@ -878,7 +875,8 @@ func TestEditOfRemotelyDeletedFileDoesNotRevive(t *testing.T) {
 	m := newMock(t)
 	srv := httptest.NewServer(m)
 	defer srv.Close()
-	dir := startMount(t, srv, "--rw", "--sync-interval", "1h")
+	// Uploading during close is what lets the error reach the editor.
+	dir := startMount(t, srv, "--rw", "--sync-interval", "1h", "--upload-delay", "0")
 	readme := filepath.Join(dir, "readme.txt")
 	f, err := os.OpenFile(readme, os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
@@ -894,5 +892,70 @@ func TestEditOfRemotelyDeletedFileDoesNotRevive(t *testing.T) {
 	}
 	if ev := m.events(); ev != "" {
 		t.Fatalf("edit of a deleted file reached the server: %s", ev)
+	}
+}
+
+func TestSavesUploadAfterClose(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	dir := startMount(t, srv, "--rw", "--sync-interval", "1h", "--upload-delay", "300ms")
+	readme := filepath.Join(dir, "readme.txt")
+
+	// Quick saves, each with an fsync, become one upload, and reads see the latest.
+	for _, text := range []string{"one\n", "two\n", "three\n"} {
+		f, err := os.OpenFile(readme, os.O_WRONLY|os.O_TRUNC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = f.WriteString(text)
+		if err := f.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := os.ReadFile(readme); err != nil || string(got) != "three\n" {
+		t.Fatalf("read before upload: %q %v", got, err)
+	}
+	if ev := m.events(); ev != "" {
+		t.Fatalf("close waited for the server: %s", ev)
+	}
+	waitContent(t, m, "readme.txt", "three\n")
+	time.Sleep(500 * time.Millisecond)
+	if ev := m.events(); ev != "PUT:3:readme.txt" {
+		t.Errorf("saves were not combined: %s", ev)
+	}
+
+	// A swap file deleted before its upload never uploads.
+	swap := filepath.Join(dir, ".readme.txt.swp")
+	if err := os.WriteFile(swap, []byte("swap"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(swap); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if ev := m.events(); ev != "POST:0:.readme.txt.swp DELETE:1:.readme.txt.swp" {
+		t.Errorf("deleted swap file: %s", ev)
+	}
+}
+
+func TestUnmountFinishesUploads(t *testing.T) {
+	m := newMock(t)
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	bin := filepath.Join(t.TempDir(), "rushfiles")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	dir, stop := mountStoppable(t, srv, bin, t.TempDir(), "--rw", "--upload-delay", "1s")
+	if err := os.WriteFile(filepath.Join(dir, "late.txt"), []byte("late\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	if got := string(m.content("late.txt")); got != "late\n" {
+		t.Fatalf("edit lost on unmount: %q", got)
 	}
 }

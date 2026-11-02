@@ -27,6 +27,9 @@ type driveOptions struct {
 	cacheDir  string
 	cacheSize int64
 	sync      *treeSync // nil with --no-sync
+	// uploadDelay is how long after a save the edit uploads; zero uploads during close.
+	uploadDelay time.Duration
+	uploads     sync.WaitGroup // background uploads not yet finished
 }
 
 // node is the mount root (share == nil), a share root, a folder or a file.
@@ -51,6 +54,9 @@ type node struct {
 	modified time.Time
 	// scrapWork marks a work file that holds no server version, so it must not be cached.
 	scrapWork bool
+	// pending is the scheduled background upload; it holds one of the handles.
+	pending  *time.Timer
+	failures int
 }
 
 var (
@@ -554,6 +560,90 @@ func (n *node) flush() error {
 	return err
 }
 
+const (
+	uploadRetries = 5
+	retryDelay    = 2 * time.Second
+)
+
+// save uploads pending edits after opts.uploadDelay, so closing a file doesn't wait
+// on the network. With a zero delay it uploads now and reports failures to the caller.
+func (n *node) save() error {
+	if !n.dirty.Load() {
+		return nil
+	}
+	if n.opts.uploadDelay <= 0 {
+		return n.flush()
+	}
+	n.schedule(n.opts.uploadDelay)
+	return nil
+}
+
+// schedule uploads after delay, restarting the wait when one is already pending
+// so a burst of saves becomes one upload. The pending upload holds a handle, which
+// keeps the work file, and what reads see, until it is done.
+func (n *node) schedule(delay time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.pending == nil || !n.pending.Stop() {
+		n.handles++
+		n.opts.uploads.Add(1)
+	}
+	var t *time.Timer
+	t = time.AfterFunc(delay, func() {
+		n.mu.Lock()
+		if n.pending == t {
+			n.pending = nil
+		}
+		n.mu.Unlock()
+		n.upload()
+	})
+	n.pending = t
+}
+
+// upload runs a scheduled upload, retrying when the server could not be reached.
+// Errors the server answered with are final.
+func (n *node) upload() {
+	defer n.opts.uploads.Done()
+	err := n.flush()
+	n.mu.Lock()
+	name := n.vf.PublicName
+	if err == nil {
+		n.failures = 0
+	} else {
+		n.failures++
+	}
+	failures := n.failures
+	n.mu.Unlock()
+	if err != nil {
+		var errno syscall.Errno
+		if failures < uploadRetries && !errors.As(err, &errno) {
+			log.Printf("upload of %q: %v; retrying", name, err)
+			n.schedule(retryDelay * time.Duration(failures))
+		} else {
+			log.Printf("upload of %q: %v", name, err)
+			n.mu.Lock()
+			n.failures = 0
+			n.mu.Unlock()
+		}
+	}
+	n.release()
+}
+
+// discard cancels a scheduled upload of a file that is being deleted or replaced.
+func (n *node) discard() {
+	n.mu.Lock()
+	cancelled := n.pending != nil && n.pending.Stop()
+	if cancelled {
+		n.pending, n.scrapWork = nil, true
+		n.dirty.Store(false)
+	}
+	n.mu.Unlock()
+	if cancelled {
+		n.release()
+		n.opts.uploads.Done()
+	}
+}
+
 func (n *node) uploadConflict(ctx context.Context, vf *VirtualFile, name string, src io.ReaderAt, size int64, mtime time.Time) error {
 	_, uploadURL, err := n.c.create(ctx, n.share, vf.ParrentID, name, attrNormal, size, mtime)
 	if err != nil || size == 0 {
@@ -656,11 +746,12 @@ func (h *editHandle) Flush(ctx context.Context) syscall.Errno {
 	if err == nil && st.Size() == 0 {
 		return 0
 	}
-	return toErrno(h.n.flush())
+	return toErrno(h.n.save())
 }
 
+// Fsync doesn't wait for the server either: editors sync on every save.
 func (h *editHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
-	return toErrno(h.n.flush())
+	return toErrno(h.n.save())
 }
 
 func (h *editHandle) Release(ctx context.Context) syscall.Errno {
@@ -668,7 +759,7 @@ func (h *editHandle) Release(ctx context.Context) syscall.Errno {
 	last := h.n.handles == 1
 	h.n.mu.Unlock()
 	if last {
-		if err := h.n.flush(); err != nil {
+		if err := h.n.save(); err != nil {
 			log.Printf("upload of %q: %v", h.n.vf.PublicName, err)
 		}
 	}
@@ -699,15 +790,7 @@ func (n *node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn,
 		if _, open := f.(*editHandle); !open {
 			// Shell redirection arrives as truncate then open, since go-fuse lacks
 			// atomic O_TRUNC. Wait so the writer's close uploads one complete version.
-			n.mu.Lock()
-			n.handles++
-			n.mu.Unlock()
-			time.AfterFunc(truncateGrace, func() {
-				if err := n.flush(); err != nil {
-					log.Printf("truncate of %q: %v", n.vf.PublicName, err)
-				}
-				n.release()
-			})
+			n.schedule(truncateGrace)
 		}
 	}
 	if mtime, ok := in.GetMTime(); ok {
@@ -820,6 +903,10 @@ func (n *node) drop(ctx context.Context, name string) syscall.Errno {
 	if vf.lockedByOther(n.c.userID) {
 		return syscall.EACCES
 	}
+	// Editors delete swap and temp files right after writing them.
+	if child := n.GetChild(name); child != nil {
+		child.Operations().(*node).discard()
+	}
 	if err := n.c.remove(ctx, n.share, vf); err != nil {
 		return toErrno(err)
 	}
@@ -882,6 +969,14 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	if vf.lockedByOther(n.c.userID) {
 		return syscall.EACCES
 	}
+	// An upload in flight would send the old name and undo the rename. One that is
+	// only scheduled picks up the new name.
+	var moved *node
+	if child := n.GetChild(name); child != nil {
+		moved = child.Operations().(*node)
+		moved.io.Lock()
+		defer moved.io.Unlock()
+	}
 	if existing, errno := dst.find(ctx, newName); errno == 0 {
 		if existing.isDir() {
 			return syscall.EISDIR
@@ -911,11 +1006,10 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	delete(n.children, name)
 	n.mu.Unlock()
 	dst.add(newName, &vf)
-	if child := n.GetChild(name); child != nil {
-		c := child.Operations().(*node)
-		c.mu.Lock()
-		c.vf.PublicName, c.vf.ParrentID = vf.PublicName, vf.ParrentID
-		c.mu.Unlock()
+	if moved != nil {
+		moved.mu.Lock()
+		moved.vf.PublicName, moved.vf.ParrentID = vf.PublicName, vf.ParrentID
+		moved.mu.Unlock()
 	}
 	return 0
 }

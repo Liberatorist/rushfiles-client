@@ -69,8 +69,12 @@ Behaviour worth knowing:
   removes it.
 - Every 5 minutes (`--trim-interval`) the mount drops memory held for paths nothing is using,
   so a tool scanning the drive doesn't leave it large. The next access looks them up again.
-- Edits upload on close. If the upload fails, the mount logs where the edit was kept
-  (`~/.cache/rushfiles-linux/files/work`).
+- Edits upload in the background a second after a save (`--upload-delay`), so closing a file
+  doesn't wait for the server, and quick saves upload once. Until then the mount shows the
+  edited copy. Unmounting waits for pending uploads. An upload that can't reach the server is
+  retried a few times; if it still fails, the mount logs where the edit was kept
+  (`~/.cache/rushfiles-linux/files/work`). `--upload-delay 0` uploads during close
+  instead, which is slower but lets the editor see an upload error.
 - If the server copy changed during an edit, the edit is saved as a
   `name (linux conflict DATE).ext` sibling.
 - There is no offline editing, pinning, or public-link/lock UI.
